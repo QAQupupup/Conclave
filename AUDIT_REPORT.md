@@ -1,16 +1,16 @@
 # 开源版本发布审计报告
 
-- 版本: `8502767a098175008ee952e9d273f278b5a87818`
-- 发布时间: 2026-07-22T05:32:54.749556+00:00
-- 开发仓库 commit: `8502767a098175008ee952e9d273f278b5a87818`
+- 版本: `f6dd637ed1187fb5a6a789ca3f2bf08e54906b97`
+- 发布时间: 2026-09-07T04:29:26.585187+00:00
+- 开发仓库 commit: `f6dd637ed1187fb5a6a789ca3f2bf08e54906b97`
 - 清单版本: `1.0.0`
 
 ## 同步文件统计
 
-- 新增/更新文件数: 270
-- 应用替换规则文件数: 1
-- 删除目录/文件数: 0
-- 核心扩展二进制数: 9
+- 新增/更新文件数: 437
+- 应用替换规则文件数: 4
+- 删除目录/文件数: 48
+- 核心扩展二进制数: 10
 
 ## 核心扩展二进制
 
@@ -19,6 +19,7 @@
 - `backend/conclave_core/conclusion_logic.cpython-312-x86_64-linux-gnu.so`
 - `backend/conclave_core/confidence.cpython-312-x86_64-linux-gnu.so`
 - `backend/conclave_core/evidence.cpython-312-x86_64-linux-gnu.so`
+- `backend/conclave_core/prompts.cpython-312-x86_64-linux-gnu.so`
 - `backend/conclave_core/roles.cpython-312-x86_64-linux-gnu.so`
 - `backend/conclave_core/scheduler.cpython-312-x86_64-linux-gnu.so`
 - `backend/conclave_core/state.cpython-312-x86_64-linux-gnu.so`
@@ -27,8 +28,21 @@
 ## 新增/更新文件
 
 - `.env.example`
+- `.github/CONTRIBUTING.md`
+- `.github/ISSUE_TEMPLATE/bug_report.yml`
+- `.github/ISSUE_TEMPLATE/config.yml`
+- `.github/ISSUE_TEMPLATE/feature_request.yml`
+- `.github/PULL_REQUEST_TEMPLATE.md`
+- `ARCHITECTURE.md`
+- `LICENSE`
+- `README.en.md`
 - `README.md`
+- `assets/screenshots/meeting-discussion.jpg`
+- `assets/screenshots/metrics-dashboard.jpg`
+- `assets/screenshots/produce-output.jpg`
+- `assets/screenshots/topology-graph.jpg`
 - `backend/Dockerfile`
+- `backend/README.md`
 - `backend/alembic.ini`
 - `backend/alembic/env.py`
 - `backend/alembic/versions/0001_initial_schema.py`
@@ -36,9 +50,11 @@
 - `backend/alembic/versions/0003_drop_cost_records_fk.py`
 - `backend/alembic/versions/0004_add_memory_tables.py`
 - `backend/alembic/versions/0005_add_meetings_composite_index.py`
+- `backend/alembic/versions/0006_align_legacy_timestamp_types.py`
+- `backend/alembic/versions/0007_add_artifacts_table.py`
+- `backend/alembic/versions/0008_add_projects_issues_tables.py`
 - `backend/alembic/versions/__init__.py`
-- `backend/app/__init__.py`
-- `backend/app/agents/__init__.py`
+- `backend/app/agents/README.md`
 - `backend/app/agents/agent_runtime.py`
 - `backend/app/agents/bug_patterns.py`
 - `backend/app/agents/compute.proto`
@@ -52,7 +68,6 @@
 - `backend/app/agents/skills.py`
 - `backend/app/agents/task_baseline.py`
 - `backend/app/agents/trace.py`
-- `backend/app/agents/worker.py`
 - `backend/app/auth.py`
 - `backend/app/auth_guard.py`
 - `backend/app/config.py`
@@ -61,35 +76,43 @@
 - `backend/app/core/exceptions.py`
 - `backend/app/dao/__init__.py`
 - `backend/app/dao/agent_role_dao.py`
-- `backend/app/dao/db_init.py`
+- `backend/app/dao/artifact_dao.py`
 - `backend/app/dao/event_dao.py`
+- `backend/app/dao/issue_dao.py`
 - `backend/app/dao/meeting_aux_dao.py`
 - `backend/app/dao/meeting_dao.py`
 - `backend/app/dao/message_dao.py`
 - `backend/app/dao/preference_dao.py`
+- `backend/app/dao/project_dao.py`
 - `backend/app/dao/tag_dao.py`
+- `backend/app/db/README.md`
 - `backend/app/db/__init__.py`
 - `backend/app/db/base.py`
 - `backend/app/db/engine.py`
 - `backend/app/db/models/__init__.py`
 - `backend/app/db/models/agent_role.py`
+- `backend/app/db/models/artifact.py`
 - `backend/app/db/models/docker_host.py`
 - `backend/app/db/models/document.py`
 - `backend/app/db/models/event.py`
+- `backend/app/db/models/graph.py`
+- `backend/app/db/models/issue.py`
 - `backend/app/db/models/meeting.py`
 - `backend/app/db/models/memory.py`
 - `backend/app/db/models/message.py`
 - `backend/app/db/models/observability.py`
+- `backend/app/db/models/project.py`
+- `backend/app/db/models/tenant.py`
+- `backend/app/db/models/tenant_member.py`
 - `backend/app/db/models/user.py`
-- `backend/app/db/qdrant_store.py`
+- `backend/app/db/models/user_account.py`
 - `backend/app/db/redis.py`
+- `backend/app/db/schema_verify.py`
 - `backend/app/db/vector_store.py`
-- `backend/app/db_legacy.py`
 - `backend/app/docker_hosts.py`
 - `backend/app/domain/__init__.py`
 - `backend/app/domain/agent_role.py`
 - `backend/app/domain/enums.py`
-- `backend/app/domain/event_payloads.py`
 - `backend/app/domain/meeting.py`
 - `backend/app/domain/message.py`
 - `backend/app/domain/ws_messages.py`
@@ -98,7 +121,7 @@
 - `backend/app/llm_providers.py`
 - `backend/app/logging_config.py`
 - `backend/app/main.py`
-- `backend/app/memory/__init__.py`
+- `backend/app/memory/README.md`
 - `backend/app/memory/models.py`
 - `backend/app/memory/profile.py`
 - `backend/app/memory/store.py`
@@ -107,6 +130,7 @@
 - `backend/app/net_auth.py`
 - `backend/app/net_auth_manager.py`
 - `backend/app/network_security.py`
+- `backend/app/observability/README.md`
 - `backend/app/observability/__init__.py`
 - `backend/app/observability/audit.py`
 - `backend/app/observability/cost_tracker.py`
@@ -114,7 +138,7 @@
 - `backend/app/observability/logger.py`
 - `backend/app/observability/metrics_store.py`
 - `backend/app/observability/sinks.py`
-- `backend/app/orchestrator/__init__.py`
+- `backend/app/orchestrator/README.md`
 - `backend/app/orchestrator/borrow_helpers.py`
 - `backend/app/orchestrator/context_manager.py`
 - `backend/app/orchestrator/evidence_helpers.py`
@@ -135,6 +159,7 @@
 - `backend/app/orchestrator/prompt_safety.py`
 - `backend/app/orchestrator/react_loop.py`
 - `backend/app/orchestrator/refine_loop.py`
+- `backend/app/orchestrator/result_aggregator.py`
 - `backend/app/orchestrator/runner.py`
 - `backend/app/orchestrator/stage_common.py`
 - `backend/app/orchestrator/stage_planners.py`
@@ -142,6 +167,9 @@
 - `backend/app/orchestrator/stage_runners.py`
 - `backend/app/orchestrator/system_prompt.py`
 - `backend/app/orchestrator/task_graph.py`
+- `backend/app/orchestrator/topic_decomposer.py`
+- `backend/app/orchestrator/workflow_templates.py`
+- `backend/app/plugins/README.md`
 - `backend/app/plugins/__init__.py`
 - `backend/app/plugins/builtin/__init__.py`
 - `backend/app/plugins/builtin/auth/__init__.py`
@@ -163,45 +191,85 @@
 - `backend/app/plugins/core/types.py`
 - `backend/app/pricing_fetcher.py`
 - `backend/app/prompt_injection.py`
-- `backend/app/prompts/bug_patterns.yaml`
-- `backend/app/rag/__init__.py`
+- `backend/app/public_paths.py`
+- `backend/app/rag/README.md`
 - `backend/app/rag/chunker.py`
+- `backend/app/rag/code_chunker.py`
+- `backend/app/rag/code_graph.py`
+- `backend/app/rag/code_index.py`
+- `backend/app/rag/code_parser.py`
+- `backend/app/rag/code_to_text.py`
+- `backend/app/rag/graph_expand.py`
 - `backend/app/rag/hyde.py`
-- `backend/app/rag/query_rewriter.py`
+- `backend/app/rag/lightrag_adapter.py`
 - `backend/app/rag/retriever.py`
+- `backend/app/rag/semantic_ingest.py`
 - `backend/app/rag/store.py`
 - `backend/app/rag/tokenize.py`
+- `backend/app/rag/topic_index.py`
+- `backend/app/rbac/__init__.py`
+- `backend/app/rbac/deps.py`
+- `backend/app/rbac/enforcer.py`
+- `backend/app/rbac/migrations.py`
+- `backend/app/rbac/model.conf`
+- `backend/app/rbac/policies.py`
 - `backend/app/report_layout.py`
-- `backend/app/routers/__init__.py`
+- `backend/app/routers/admin.py`
 - `backend/app/routers/agent_roles.py`
+- `backend/app/routers/artifacts.py`
 - `backend/app/routers/audit_logs.py`
-- `backend/app/routers/auth.py`
 - `backend/app/routers/captcha.py`
+- `backend/app/routers/code.py`
+- `backend/app/routers/config.py`
 - `backend/app/routers/docker_hosts.py`
 - `backend/app/routers/documents.py`
+- `backend/app/routers/graph.py`
+- `backend/app/routers/issues.py`
 - `backend/app/routers/meetings.py`
 - `backend/app/routers/metrics.py`
 - `backend/app/routers/net_auth.py`
+- `backend/app/routers/notifications.py`
 - `backend/app/routers/preferences.py`
+- `backend/app/routers/projects.py`
 - `backend/app/routers/regression.py`
+- `backend/app/routers/system.py`
+- `backend/app/routers/teams.py`
 - `backend/app/routers/workspace.py`
 - `backend/app/routers/ws.py`
 - `backend/app/sandbox.py`
 - `backend/app/schemas/__init__.py`
 - `backend/app/schemas/agent_role.py`
+- `backend/app/schemas/artifact.py`
 - `backend/app/schemas/auth.py`
 - `backend/app/schemas/captcha.py`
+- `backend/app/schemas/code.py`
 - `backend/app/schemas/common.py`
+- `backend/app/schemas/issue.py`
 - `backend/app/schemas/meeting.py`
 - `backend/app/schemas/net_auth.py`
 - `backend/app/schemas/preferences.py`
+- `backend/app/schemas/project.py`
 - `backend/app/schemas/regression.py`
 - `backend/app/schemas/workspace.py`
-- `backend/app/services/__init__.py`
+- `backend/app/services/artifact_service.py`
+- `backend/app/services/config_service.py`
+- `backend/app/services/git_service.py`
+- `backend/app/services/issue_service.py`
 - `backend/app/services/key_store.py`
+- `backend/app/services/knowledge_graph.py`
+- `backend/app/services/merge_service.py`
+- `backend/app/services/recording_store.py`
+- `backend/app/services/team_service.py`
+- `backend/app/skills/async_safety.yaml`
+- `backend/app/skills/audit_invariants.yaml`
+- `backend/app/skills/code_conventions.oss.yaml`
 - `backend/app/skills/code_conventions.yaml`
-- `backend/app/skills/communication_style.yaml`
-- `backend/app/skills/deliverable_quality.yaml`
+- `backend/app/skills/code_review.yaml`
+- `backend/app/skills/communication_style.oss.yaml`
+- `backend/app/skills/deliverable_quality.oss.yaml`
+- `backend/app/skills/prd_traceability.yaml`
+- `backend/app/skills/task_decomposition.yaml`
+- `backend/app/skills/ui_design_system.oss.yaml`
 - `backend/app/skills/ui_design_system.yaml`
 - `backend/app/tenants/__init__.py`
 - `backend/app/tenants/context.py`
@@ -209,15 +277,14 @@
 - `backend/app/tenants/models.py`
 - `backend/app/tenants/service.py`
 - `backend/app/tenants/settings_override.py`
+- `backend/app/tools/README.md`
 - `backend/app/tools/__init__.py`
 - `backend/app/tools/browser_tool.py`
 - `backend/app/tools/captcha_guard.py`
 - `backend/app/tools/domain_registry.py`
-- `backend/app/tools/engines/__init__.py`
 - `backend/app/tools/engines/bing_engine.py`
 - `backend/app/tools/engines/ddg_engine.py`
 - `backend/app/tools/navigation_skill.py`
-- `backend/app/tools/playwright/__init__.py`
 - `backend/app/tools/playwright/captcha_js.py`
 - `backend/app/tools/playwright/chunk_js.py`
 - `backend/app/tools/playwright/extract_js.py`
@@ -229,30 +296,197 @@
 - `backend/app/tools/rate_limiter.py`
 - `backend/app/tools/search_engine.py`
 - `backend/app/tools/workspace_tools.py`
-- `backend/app/utils/__init__.py`
 - `backend/app/utils/tasks.py`
 - `backend/conclave_core/__init__.py`
 - `backend/conclave_core/charter.py`
 - `backend/conclave_core/conclusion_chain.py`
 - `backend/docker/sandbox-datascience/Dockerfile`
-- `backend/docker/setup-docker-host.sh`
 - `backend/entrypoint.sh`
 - `backend/pyproject.toml`
 - `backend/requirements.txt`
-- `backend/workspace/constraints.yaml`
+- `doc-public/DEPLOYMENT.md`
+- `doc-public/FAQ.md`
+- `doc-public/FEATURES.md`
+- `doc-public/GETTING_STARTED.md`
 - `docker-compose.yml`
-- `docker/Dockerfile.postgres`
-- `docker/Dockerfile.qdrant`
+- `docker/entrypoint-gitea.sh`
 - `frontend/.dockerignore`
 - `frontend/Dockerfile`
+- `frontend/Dockerfile.dev`
+- `frontend/README.md`
 - `frontend/app.html`
+- `frontend/components.json`
 - `frontend/eslint.config.js`
 - `frontend/nginx.conf`
+- `frontend/nginx.preview.conf`
 - `frontend/package-lock.json`
 - `frontend/package.json`
 - `frontend/public/demo.html`
+- `frontend/public/favicon.svg`
 - `frontend/public/index.html`
 - `frontend/src/App.tsx`
+- `frontend/src/__tests__/auth-flow-integration.test.tsx`
+- `frontend/src/__tests__/regression-find-on-undefined.test.tsx`
+- `frontend/src/app.css`
+- `frontend/src/components/auth/admin-route.tsx`
+- `frontend/src/components/auth/protected-route.tsx`
+- `frontend/src/components/error-boundary.tsx`
+- `frontend/src/components/layout/__tests__/top-bar.test.tsx`
+- `frontend/src/components/layout/app-shell.tsx`
+- `frontend/src/components/layout/command-palette.tsx`
+- `frontend/src/components/layout/nav-rail.tsx`
+- `frontend/src/components/layout/status-bar.tsx`
+- `frontend/src/components/layout/top-bar.tsx`
+- `frontend/src/components/meeting/__tests__/canvas-rail.test.tsx`
+- `frontend/src/components/meeting/__tests__/operation-replay-utils.test.ts`
+- `frontend/src/components/meeting/__tests__/thought-tree.test.tsx`
+- `frontend/src/components/meeting/canvas-layer.tsx`
+- `frontend/src/components/meeting/canvas-rail.tsx`
+- `frontend/src/components/meeting/insights-panel.tsx`
+- `frontend/src/components/meeting/message-bubble.tsx`
+- `frontend/src/components/meeting/message-stream.tsx`
+- `frontend/src/components/meeting/operation-replay-utils.ts`
+- `frontend/src/components/meeting/operation-replay.tsx`
+- `frontend/src/components/meeting/recording-image.tsx`
+- `frontend/src/components/meeting/stage-timeline.tsx`
+- `frontend/src/components/meeting/takeover-panel.tsx`
+- `frontend/src/components/meeting/thought-tree.tsx`
+- `frontend/src/components/meeting/tool-call-card.tsx`
+- `frontend/src/components/meeting/tool-icons.tsx`
+- `frontend/src/components/meeting/web-search-replay.tsx`
+- `frontend/src/components/report/__tests__/report-block-renderer.test.tsx`
+- `frontend/src/components/report/report-block-renderer.tsx`
+- `frontend/src/components/report/report-block-utils.ts`
+- `frontend/src/components/ui/__tests__/floating-panel-sizing.test.ts`
+- `frontend/src/components/ui/__tests__/floating-panel.test.tsx`
+- `frontend/src/components/ui/__tests__/form-feedback.test.tsx`
+- `frontend/src/components/ui/__tests__/side-panel.test.tsx`
+- `frontend/src/components/ui/avatar.tsx`
+- `frontend/src/components/ui/badge.tsx`
+- `frontend/src/components/ui/button.tsx`
+- `frontend/src/components/ui/card.tsx`
+- `frontend/src/components/ui/confirm-dialog.tsx`
+- `frontend/src/components/ui/dialog.tsx`
+- `frontend/src/components/ui/dropdown-menu.tsx`
+- `frontend/src/components/ui/floating-panel-sizing.ts`
+- `frontend/src/components/ui/floating-panel.tsx`
+- `frontend/src/components/ui/form-feedback.tsx`
+- `frontend/src/components/ui/input.tsx`
+- `frontend/src/components/ui/label.tsx`
+- `frontend/src/components/ui/markdown.tsx`
+- `frontend/src/components/ui/progress.tsx`
+- `frontend/src/components/ui/scroll-area.tsx`
+- `frontend/src/components/ui/select.tsx`
+- `frontend/src/components/ui/separator.tsx`
+- `frontend/src/components/ui/side-panel.tsx`
+- `frontend/src/components/ui/skeleton.tsx`
+- `frontend/src/components/ui/svg-icons.tsx`
+- `frontend/src/components/ui/tabs.tsx`
+- `frontend/src/components/ui/textarea.tsx`
+- `frontend/src/components/ui/toast.tsx`
+- `frontend/src/components/ui/tooltip.tsx`
+- `frontend/src/features/admin/page.tsx`
+- `frontend/src/features/agents/page.tsx`
+- `frontend/src/features/board/__tests__/new-page.test.tsx`
+- `frontend/src/features/board/__tests__/page.test.tsx`
+- `frontend/src/features/board/new-page.tsx`
+- `frontend/src/features/board/page.tsx`
+- `frontend/src/features/explore/page.tsx`
+- `frontend/src/features/graph/__tests__/page.test.tsx`
+- `frontend/src/features/graph/lib/force-layout.ts`
+- `frontend/src/features/graph/lib/mock-data.ts`
+- `frontend/src/features/graph/lib/types.ts`
+- `frontend/src/features/graph/page.tsx`
+- `frontend/src/features/login/__tests__/page.test.tsx`
+- `frontend/src/features/login/page.tsx`
+- `frontend/src/features/meeting-canvas/__tests__/page.test.tsx`
+- `frontend/src/features/meeting-canvas/page.tsx`
+- `frontend/src/features/models/page.tsx`
+- `frontend/src/features/monitoring/page.tsx`
+- `frontend/src/features/not-found/page.tsx`
+- `frontend/src/features/operations/page.tsx`
+- `frontend/src/features/projects/__tests__/detail-page.test.tsx`
+- `frontend/src/features/projects/__tests__/page.test.tsx`
+- `frontend/src/features/projects/detail-page.tsx`
+- `frontend/src/features/projects/merge-utils.ts`
+- `frontend/src/features/projects/page.tsx`
+- `frontend/src/features/projects/project-form-dialog.tsx`
+- `frontend/src/features/reports/page.tsx`
+- `frontend/src/features/settings/__tests__/page.test.tsx`
+- `frontend/src/features/settings/page.tsx`
+- `frontend/src/features/setup/__tests__/page.test.tsx`
+- `frontend/src/features/setup/page.tsx`
+- `frontend/src/features/teams/page.tsx`
+- `frontend/src/features/workspace/page.tsx`
+- `frontend/src/hooks/__tests__/use-projects.test.ts`
+- `frontend/src/hooks/index.ts`
+- `frontend/src/hooks/toaster.tsx`
+- `frontend/src/hooks/use-meetings.ts`
+- `frontend/src/hooks/use-projects.ts`
+- `frontend/src/hooks/use-rbac.ts`
+- `frontend/src/hooks/use-realtime.ts`
+- `frontend/src/hooks/use-toast.ts`
+- `frontend/src/lib/__tests__/agent-merge.test.ts`
+- `frontend/src/lib/__tests__/api-contract.test.ts`
+- `frontend/src/lib/__tests__/markdown-normalize.test.ts`
+- `frontend/src/lib/ag-ui/client.ts`
+- `frontend/src/lib/agent-merge.ts`
+- `frontend/src/lib/api.ts`
+- `frontend/src/lib/constants.ts`
+- `frontend/src/lib/crypto.ts`
+- `frontend/src/lib/extract.ts`
+- `frontend/src/lib/index.ts`
+- `frontend/src/lib/markdown-normalize.ts`
+- `frontend/src/lib/mock-data.ts`
+- `frontend/src/lib/teams-api.ts`
+- `frontend/src/lib/utils.ts`
+- `frontend/src/lib/ws.ts`
+- `frontend/src/main.tsx`
+- `frontend/src/providers/index.tsx`
+- `frontend/src/providers/theme-context.ts`
+- `frontend/src/providers/theme-provider.tsx`
+- `frontend/src/stores/__tests__/auth-slice.test.ts`
+- `frontend/src/stores/__tests__/meeting-slice.test.ts`
+- `frontend/src/stores/__tests__/ui-slice.test.ts`
+- `frontend/src/stores/auth-slice.ts`
+- `frontend/src/stores/meeting-slice.ts`
+- `frontend/src/stores/ui-slice.ts`
+- `frontend/src/stores/ws-slice.ts`
+- `frontend/src/test/setup.ts`
+- `frontend/src/test/test-utils.tsx`
+- `frontend/src/test/utils.test.ts`
+- `frontend/src/types/ag-ui.ts`
+- `frontend/src/types/api.ts`
+- `frontend/src/types/index.ts`
+- `frontend/src/types/meeting.ts`
+- `frontend/src/types/rbac.ts`
+- `frontend/src/vite-env.d.ts`
+- `frontend/tsconfig.json`
+- `frontend/vite.config.ts`
+- `frontend/vitest.config.ts`
+
+## 应用替换规则的文件
+
+- `backend/app/skills/code_conventions.yaml (oss override)`
+- `backend/app/skills/communication_style.yaml (oss override)`
+- `backend/app/skills/deliverable_quality.yaml (oss override)`
+- `backend/app/skills/ui_design_system.yaml (oss override)`
+
+## 删除的敏感/内部目录或文件
+
+- `backend/app/agents/worker.py`
+- `backend/app/dao/db_init.py`
+- `backend/app/db/qdrant_store.py`
+- `backend/app/db_legacy.py`
+- `backend/app/domain/event_payloads.py`
+- `backend/app/routers/auth.py`
+- `backend/app/skills/code_conventions.oss.yaml`
+- `backend/app/skills/communication_style.oss.yaml`
+- `backend/app/skills/deliverable_quality.oss.yaml`
+- `backend/app/skills/ui_design_system.oss.yaml`
+- `backend/app/tools/playwright/captcha_js.py`
+- `backend/app/tools/playwright/stealth_js.py`
+- `docker-compose.yml`
 - `frontend/src/components/CommandPalette.tsx`
 - `frontend/src/components/ConfirmModal.tsx`
 - `frontend/src/components/ContextPanel.tsx`
@@ -270,17 +504,12 @@
 - `frontend/src/data/mock.ts`
 - `frontend/src/data/reportData.ts`
 - `frontend/src/data/reportLayouts.ts`
-- `frontend/src/lib/api.ts`
 - `frontend/src/lib/auth.ts`
 - `frontend/src/lib/format.ts`
-- `frontend/src/lib/ws.ts`
-- `frontend/src/main.tsx`
 - `frontend/src/state/AppContext.tsx`
 - `frontend/src/styles/global.css`
 - `frontend/src/test/format.test.ts`
-- `frontend/src/test/setup.ts`
 - `frontend/src/test/ws.test.ts`
-- `frontend/src/types/meeting.ts`
 - `frontend/src/views/Board.tsx`
 - `frontend/src/views/DevOpsPanel.css`
 - `frontend/src/views/DevOpsPanel.tsx`
@@ -293,16 +522,6 @@
 - `frontend/src/views/Report.tsx`
 - `frontend/src/views/Settings.tsx`
 - `frontend/src/views/Topology.tsx`
-- `frontend/src/vite-env.d.ts`
-- `frontend/tsconfig.json`
-- `frontend/vite.config.ts`
-
-## 应用替换规则的文件
-
-- `README.md`
-
-## 删除的敏感/内部目录或文件
-
 
 ## 说明
 

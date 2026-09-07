@@ -14,12 +14,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import ipaddress
 import logging
 import re
 import time
 from typing import Any
-from urllib.parse import urlparse
+
+from app.lazy_asyncio import LazyLock
+from app.network_security import validate_url_async
 
 from .playwright_search import _STEALTH_JS, _USER_AGENT
 
@@ -43,74 +44,34 @@ LOG_SUMMARY_MAX_BYTES = 2048  # 日志摘要最大 2KB
 # 域名白名单（空列表 = 允许所有公网域名，但拒绝私网）
 ALLOWED_DOMAINS: list[str] = []  # 通配符格式: "*.github.com" 或 "example.com"
 
-# 始终拒绝的 scheme
-_BLOCKED_SCHEMES = {"file", "data", "javascript", "vbscript", "about", "blob"}
+
+def _normalized_allowed_domains() -> set[str] | None:
+    """将 ALLOWED_DOMAINS 通配符模式归一化为 network_security 的域名集合。
+
+    ``*.github.com`` → ``github.com``（validate_url 自动匹配子域名）。
+    空列表返回 None（= 不限制域名，但仍拒绝内网/保留地址）。
+    """
+    if not ALLOWED_DOMAINS:
+        return None
+    return {p[2:] if p.startswith("*.") else p for p in ALLOWED_DOMAINS}
 
 
-# 私网 IP 范围
-def _is_private_ip(hostname: str) -> bool:
-    """检查 hostname 是否为私网/保留地址"""
-    try:
-        ip = ipaddress.ip_address(hostname)
-        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
-    except ValueError:
-        # 不是 IP 地址，检查常见内网域名
-        return hostname in ("localhost", "metadata.google.internal")
+async def _is_url_allowed(url: str) -> tuple[bool, str]:
+    """校验 URL 安全性（P0-2 + N5）。
 
-
-def _matches_domain(hostname: str, pattern: str) -> bool:
-    """检查 hostname 是否匹配域名通配符模式"""
-    if pattern.startswith("*."):
-        suffix = pattern[1:]  # .github.com
-        return hostname.endswith(suffix)
-    return hostname == pattern
-
-
-def _is_url_allowed(url: str) -> tuple[bool, str]:
-    """校验 URL 安全性（P0-2 + N5）
-
-    检查项：
-    1. scheme 必须是 http/https
-    2. 拒绝 file/data/javascript 等危险 scheme
-    3. 拒绝私网 IP / localhost / 元数据端点
-    4. hostname 白名单（如果配置了）
+    [P1 修复] 统一到 app.network_security.validate_url_async 单一可信来源，
+    消除与 playwright/security.py 的双实现漂移风险。检查项：
+    1. scheme 必须是 http/https（file/data/javascript 等危险 scheme 一并拒绝）
+    2. 拒绝私网/保留 IP（含数字型变体：http://2130706433/ → 127.0.0.1）
+    3. 拒绝黑名单主机名（localhost / 云元数据端点）
+    4. hostname 白名单（如果配置了 ALLOWED_DOMAINS）
     5. 检测 URL 中的 userinfo 绕过（http://allowed@evil.com）
+    6. DNS 解析后所有 IP 黑名单（防 DNS rebinding 初始检查，线程池执行）
 
     Returns:
         (allowed: bool, reason: str)
     """
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False, "URL 解析失败"
-
-    # scheme 校验
-    if parsed.scheme not in ("http", "https"):
-        return False, f"scheme '{parsed.scheme}' 不允许（仅 http/https）"
-
-    if parsed.scheme in _BLOCKED_SCHEMES:
-        return False, f"scheme '{parsed.scheme}' 被禁止"
-
-    hostname = parsed.hostname or ""
-    if not hostname:
-        return False, "URL 缺少 hostname"
-
-    # 私网 IP 拒绝
-    if _is_private_ip(hostname):
-        return False, f"私网/保留地址 '{hostname}' 被拒绝"
-
-    # userinfo 绕过检测（http://allowed.com@evil.com/）
-    if "@" in (parsed.netloc or ""):
-        # 提取 @ 后面的真实 host
-        real_host = parsed.netloc.rsplit("@", 1)[-1].split(":")[0]
-        if real_host != hostname:
-            return False, f"URL userinfo 绕过检测：声称 '{hostname}' 实际 '{real_host}'"
-
-    # 白名单校验（如果配置了）
-    if ALLOWED_DOMAINS and not any(_matches_domain(hostname, p) for p in ALLOWED_DOMAINS):
-        return False, f"hostname '{hostname}' 不在白名单中"
-
-    return True, "ok"
+    return await validate_url_async(url, allowed_domains=_normalized_allowed_domains())
 
 
 # ================================================================
@@ -359,7 +320,7 @@ class BrowserPool:
         # C-1: NavigationSkill 排他锁（按 meeting_id 隔离）
         # 当 NavigationSkill 执行时，锁住整个 meeting 的浏览器操作，
         # 防止 web_search 等并发操作干扰页面状态
-        self._exclusive_locks: dict[str, asyncio.Lock] = {}
+        self._exclusive_locks: dict[str, LazyLock] = {}
 
     async def _ensure_browser(self) -> None:
         """延迟初始化 Chromium"""
@@ -432,8 +393,9 @@ class BrowserPool:
                 java_script_enabled=True,
                 bypass_csp=True,  # N2: 绕过 CSP 限制
             )
-            # 在页面 JS 前注入 stealth 脚本（await 确保首个 page 也能注入）
-            await context.add_init_script(_STEALTH_JS)
+            # 在页面 JS 前注入 stealth 脚本（开源版为空时跳过）
+            if _STEALTH_JS:
+                await context.add_init_script(_STEALTH_JS)
             session = _ContextSession(context, meeting_id, self)
             self._contexts[meeting_id] = session
 
@@ -464,11 +426,13 @@ class BrowserPool:
             extra={"meeting_id": meeting_id, "remaining_contexts": len(self._contexts)},
         )
 
-    def get_exclusive_lock(self, meeting_id: str) -> asyncio.Lock:
+    def get_exclusive_lock(self, meeting_id: str) -> LazyLock:
         """获取指定 meeting 的排他锁（NavigationSkill 使用）
 
         NavigationSkill 执行期间持有此锁，阻塞同 meeting 的其他浏览器操作。
         这是 blocking 模式：NavigationSkill 首次实现不共享浏览器上下文。
+
+        [P1-14 修复] 使用 setdefault + LazyLock 避免 TOCTOU 竞态和事件循环绑定问题。
 
         用法：
             lock = pool.get_exclusive_lock(meeting_id)
@@ -476,9 +440,7 @@ class BrowserPool:
                 # 执行 NavigationSkill 步骤
                 ...
         """
-        if meeting_id not in self._exclusive_locks:
-            self._exclusive_locks[meeting_id] = asyncio.Lock()
-        return self._exclusive_locks[meeting_id]
+        return self._exclusive_locks.setdefault(meeting_id, LazyLock())
 
     async def _reclaim_oldest_idle(self) -> None:
         """回收最空闲的 Context"""
@@ -557,9 +519,9 @@ class BrowserTool:
     # URL 安全校验（P0-2 + N5）
     # ================================================================
 
-    def _check_url(self, url: str) -> tuple[bool, str]:
-        """URL 安全校验"""
-        return _is_url_allowed(url)
+    async def _check_url(self, url: str) -> tuple[bool, str]:
+        """URL 安全校验（异步：含 DNS 解析校验，防 DNS rebinding 初始检查）"""
+        return await _is_url_allowed(url)
 
     async def _verify_post_redirect(self, page: Any) -> tuple[bool, str]:
         """重定向后 URL 校验（N5）
@@ -567,7 +529,7 @@ class BrowserTool:
         goto 完成后检查最终 URL 是否安全（防止白名单域名重定向到恶意域名）。
         """
         final_url = page.url
-        allowed, reason = _is_url_allowed(final_url)
+        allowed, reason = await _is_url_allowed(final_url)
         if not allowed:
             return False, f"重定向后 URL 不安全: {reason} (final={final_url})"
         return True, "ok"
@@ -581,7 +543,7 @@ class BrowserTool:
     ) -> dict[str, Any]:
         """导航到指定 URL（含安全校验 + 重定向验证 + 导航深度检查）"""
         # 安全校验
-        allowed, reason = self._check_url(url)
+        allowed, reason = await self._check_url(url)
         if not allowed:
             return {"status": "error", "error": f"URL 被拒绝: {reason}", "url": url}
 
@@ -1109,7 +1071,18 @@ class BrowserTool:
     # ================================================================
 
     async def evaluate(self, meeting_id: str, expression: str, arg: Any = None, page_index: int = 0) -> Any:
-        """在页面执行 JS（10s 超时 + 1MB 截断）"""
+        """在页面执行 JS（10s 超时 + 1MB 截断）
+
+        [Wave 8] defense-in-depth: 表达式安全验证（上游 react_loop 已验证，
+        此处再次验证防止直接调用绕过）
+        """
+        # [Wave 8] 安全验证：阻断危险 JS 模式
+        from app.orchestrator.prompt_safety import validate_js_expression
+
+        is_safe, reason = validate_js_expression(expression)
+        if not is_safe:
+            return {"status": "blocked", "reason": reason, "expression": expression[:200]}
+
         ps = await self._get_page(meeting_id, page_index)
 
         async def _do(page):
@@ -1137,7 +1110,17 @@ class BrowserTool:
         arg: Any = None,
         page_index: int = 0,
     ) -> Any:
-        """在匹配元素上执行 JS"""
+        """在匹配元素上执行 JS
+
+        [Wave 8] defense-in-depth: 表达式安全验证
+        """
+        # [Wave 8] 安全验证：阻断危险 JS 模式
+        from app.orchestrator.prompt_safety import validate_js_expression
+
+        is_safe, reason = validate_js_expression(expression)
+        if not is_safe:
+            return {"status": "blocked", "reason": reason, "expression": expression[:200]}
+
         ps = await self._get_page(meeting_id, page_index)
 
         async def _do(page):
@@ -1174,7 +1157,7 @@ class BrowserTool:
         ctx.pages.append(ps)
 
         if url:
-            allowed, reason = self._check_url(url)
+            allowed, reason = await self._check_url(url)
             if not allowed:
                 return {"status": "error", "error": f"URL 被拒绝: {reason}"}
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)

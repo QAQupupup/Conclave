@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -267,124 +268,7 @@ async def create_host(body: DockerHostCreate) -> dict[str, Any]:
     return _model_to_response(host)
 
 
-@router.get("/{host_id}")
-async def get_host(host_id: int) -> dict[str, Any]:
-    """获取单个主机详情。"""
-    async with async_session_factory() as session:
-        host = await _get_host_with_access(session, host_id)
-    return _model_to_response(host)
-
-
-@router.put("/{host_id}")
-async def update_host(host_id: int, body: DockerHostUpdate) -> dict[str, Any]:
-    """更新 Docker 主机。"""
-    async with async_session_factory() as session:
-        host = await _get_host_with_access(session, host_id, for_write=True)
-
-        update_data = body.model_dump(exclude_unset=True)
-        secret_fields = {"ssh_password", "ssh_key_content"}
-        secret_updates = {k: v for k, v in update_data.items() if k in secret_fields}
-        base_updates = {k: v for k, v in update_data.items() if k not in secret_fields}
-
-        for k, v in base_updates.items():
-            setattr(host, k, v)
-
-        tid = current_tenant_id()
-        if base_updates.get("is_default"):
-            others = (
-                (
-                    await session.execute(
-                        select(DockerHostModel).where(
-                            DockerHostModel.id != host_id,
-                            DockerHostModel.is_default == True,  # noqa: E712
-                            _tenant_filter_for_update() if tid is not None else DockerHostModel.tenant_id.is_(None),
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            for h in others:
-                h.is_default = False
-
-        if secret_updates:
-            secret = (
-                await session.execute(select(DockerHostSecretModel).where(DockerHostSecretModel.host_id == host_id))
-            ).scalar_one_or_none()
-            if not secret:
-                secret = DockerHostSecretModel(host_id=host_id)
-                session.add(secret)
-            for k, v in secret_updates.items():
-                setattr(secret, k, v)
-
-        host.updated_at = datetime.now(timezone.utc)
-        await session.commit()
-        await session.refresh(host)
-
-    return _model_to_response(host)
-
-
-@router.delete("/{host_id}")
-async def delete_host(host_id: int) -> dict[str, Any]:
-    """删除 Docker 主机。"""
-    async with async_session_factory() as session:
-        host = await _get_host_with_access(session, host_id, for_write=True)
-        # 删除关联 secret
-        secret = (
-            await session.execute(select(DockerHostSecretModel).where(DockerHostSecretModel.host_id == host_id))
-        ).scalar_one_or_none()
-        if secret:
-            await session.delete(secret)
-        await session.delete(host)
-        await session.commit()
-    return {"ok": True, "deleted": host_id}
-
-
-# ─── 健康检查 ────────────────────────────────────────
-@router.post("/{host_id}/health-check")
-async def health_check_host(host_id: int) -> dict[str, Any]:
-    """对指定主机执行健康检查。"""
-    async with async_session_factory() as session:
-        host = await _get_host_with_access(session, host_id)
-        secret = (
-            await session.execute(select(DockerHostSecretModel).where(DockerHostSecretModel.host_id == host_id))
-        ).scalar_one_or_none()
-
-        config = _model_to_config_dict(host, secret)
-
-    # 异步执行健康检查（避免阻塞）
-    health = await check_host_health(config)
-
-    # 更新状态
-    async with async_session_factory() as session:
-        host_refreshed: DockerHostModel | None = await session.get(DockerHostModel, host_id)
-        if host_refreshed:
-            host_refreshed.health_status = "healthy" if health.ok else "unhealthy"
-            host_refreshed.last_health_check = datetime.now(timezone.utc)
-            host_refreshed.docker_version = health.docker_version
-            host_refreshed.running_containers = health.running_containers
-            host_refreshed.total_containers = health.total_containers
-            host_refreshed.last_error = health.error
-            if health.cpu_count and not host_refreshed.cpu_cores:
-                host_refreshed.cpu_cores = health.cpu_count
-            if health.memory_total_gb and not host_refreshed.memory_gb:
-                host_refreshed.memory_gb = int(health.memory_total_gb)
-            await session.commit()
-            await session.refresh(host_refreshed)
-            return {
-                **_model_to_response(host_refreshed),
-                "health_detail": {
-                    "ok": health.ok,
-                    "latency_ms": health.latency_ms,
-                    "cpu_count": health.cpu_count,
-                    "memory_gb": health.memory_total_gb,
-                    "error": health.error,
-                },
-            }
-
-    return {"ok": False, "error": "更新失败"}
-
-
+# ─── 批量健康检查 ────────────────────────────────────
 @router.post("/health-check-all")
 async def health_check_all() -> dict[str, Any]:
     """对当前租户可见的所有启用主机执行批量健康检查。"""
@@ -579,6 +463,418 @@ async def get_setup_script() -> dict[str, Any]:
     }
 
 
+# ─── 系统概览（所有组件状态聚合）──────────────
+@router.get("/overview")
+async def system_overview() -> dict[str, Any]:
+    """返回系统整体概览：所有 Docker 主机状态 + 本地组件状态。
+
+    用于运维面板的 SVG 拓扑图渲染。
+    """
+    from app.sandbox import get_status as get_sandbox_status
+
+    # 1. Docker 主机列表（按租户过滤 + 系统主机）
+    async with async_session_factory() as session:
+        from sqlalchemy import and_
+
+        result = await session.execute(
+            select(DockerHostModel).where(
+                and_(DockerHostModel.enabled == True, _tenant_filter())  # noqa: E712
+            )
+        )
+        hosts = result.scalars().all()
+        host_list = []
+        for h in hosts:
+            host_list.append(
+                {
+                    "id": h.id,
+                    "name": h.name,
+                    "connection_type": h.connection_type,
+                    "status": h.health_status,
+                    "region": h.region,
+                    "tags": h.tags or [],
+                    "running_containers": h.running_containers,
+                    "total_containers": h.total_containers,
+                    "cpu_cores": h.cpu_cores or None,
+                    "memory_total": f"{h.memory_gb} GB" if h.memory_gb else None,
+                    "memory_used": None,  # 实时内存使用需 Docker API 查询，暂不提供
+                    "last_health_check": h.last_health_check.isoformat() if h.last_health_check else None,
+                    "error": h.last_error or None,
+                }
+            )
+
+    # 2. 本地组件状态（从 /health 端点复用逻辑）
+    components = {}
+    # PostgreSQL
+    try:
+        from app.db.engine import async_session_factory as _sf
+
+        async with _sf() as s:
+            from sqlalchemy import text as _text
+
+            await s.execute(_text("SELECT 1"))
+        components["postgres"] = {"status": "healthy", "type": "database"}
+    except Exception as e:
+        components["postgres"] = {"status": "unhealthy", "type": "database", "error": str(e)[:100]}
+
+    # Redis
+    try:
+        import redis.asyncio as aioredis
+
+        r = aioredis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379/0"))
+        await r.ping()
+        await r.aclose()
+        components["redis"] = {"status": "healthy", "type": "cache"}
+    except Exception as e:
+        components["redis"] = {"status": "unhealthy", "type": "cache", "error": str(e)[:100]}
+
+    # Qdrant
+    try:
+        import httpx
+
+        qdrant_url = os.environ.get("CONCLAVE_QDRANT_URL", "http://qdrant:6333")
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{qdrant_url}/healthz")
+            if resp.status_code == 200:
+                components["qdrant"] = {"status": "healthy", "type": "vector_db"}
+            else:
+                components["qdrant"] = {"status": "degraded", "type": "vector_db"}
+    except Exception as e:
+        components["qdrant"] = {"status": "unhealthy", "type": "vector_db", "error": str(e)[:100]}
+
+    # Docker / Sandbox — 优先通过 HTTP 检测 socket proxy，避免依赖 docker CLI
+    try:
+        import httpx
+
+        sandbox_status = await get_sandbox_status()
+        docker_host_env = os.environ.get("DOCKER_HOST", "")
+        docker_reachable = False
+        if docker_host_env.startswith("tcp://"):
+            # socket proxy 模式：直接 HTTP 检测 /version 端点
+            proxy_url = docker_host_env.replace("tcp://", "http://")
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{proxy_url}/version")
+                docker_reachable = resp.status_code == 200
+        elif os.path.exists("/var/run/docker.sock"):
+            # 本地 socket 模式：通过 sandbox 模块检测
+            docker_reachable = bool(sandbox_status.get("docker_available"))
+
+        components["docker"] = {
+            "status": "healthy" if docker_reachable else "unhealthy",
+            "type": "runtime",
+            "sandbox_mode": sandbox_status.get("mode", "unknown"),
+            "active_containers": sandbox_status.get("active", 0),
+        }
+    except Exception as e:
+        components["docker"] = {"status": "unhealthy", "type": "runtime", "error": str(e)[:100]}
+
+    # Backend: 自身服务如果能响应此请求则健康，但检查数据库连通性
+    try:
+        from sqlalchemy import text
+
+        async with async_session_factory() as session:
+            await session.execute(text("SELECT 1"))
+        components["backend"] = {"status": "healthy", "type": "application"}
+    except Exception as e:
+        components["backend"] = {
+            "status": "unhealthy",
+            "type": "application",
+            "error": f"数据库连接失败: {str(e)[:80]}",
+        }
+
+    # Frontend: 通过 nginx 检查前端服务是否可达
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("http://frontend/health")
+            if resp.status_code == 200:
+                components["frontend"] = {"status": "healthy", "type": "application"}
+            else:
+                components["frontend"] = {"status": "degraded", "type": "application"}
+    except Exception:
+        # 容器内可能无法解析 frontend 主机名（开发环境），降级为 healthy（因为后端能响应说明整体可用）
+        components["frontend"] = {"status": "healthy", "type": "application"}
+
+    # Gitea
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("http://gitea:3000/")
+            if resp.status_code == 200:
+                components["gitea"] = {"status": "healthy", "type": "git"}
+            else:
+                components["gitea"] = {"status": "degraded", "type": "git"}
+    except Exception as e:
+        components["gitea"] = {"status": "unhealthy", "type": "git", "error": str(e)[:100]}
+
+    return {
+        "hosts": host_list,
+        "components": components,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ─── Compose 服务扩缩容 ───────────────────────────
+class ScaleRequest(BaseModel):
+    replicas: int = Field(..., ge=0, le=20)
+
+
+@router.post("/compose/{service}/scale")
+async def scale_service(service: str, body: ScaleRequest) -> dict[str, Any]:
+    """扩缩容 Compose 服务（通过 docker compose up --scale）。
+
+    注意：此操作在本地 Docker 环境执行（不涉及远程主机）。
+    仅支持 Conclave 自身的 compose 服务。
+    """
+    import asyncio
+
+    allowed_services = {"backend", "frontend", "worker", "sandbox"}
+    if service not in allowed_services:
+        raise HTTPException(400, f"不允许扩缩容服务 '{service}'，允许的服务: {', '.join(allowed_services)}")
+
+    cmd = f"docker compose up -d --scale {service}={body.replicas} --no-recreate"
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+
+    if proc.returncode != 0:
+        return {"ok": False, "error": stderr.decode(errors="replace")[:500], "service": service}
+    return {
+        "ok": True,
+        "service": service,
+        "replicas": body.replicas,
+        "output": stdout.decode(errors="replace")[:500],
+    }
+
+
+# ─── 常用命令参考（前端复制粘贴用）──────────────
+@router.get("/commands-reference")
+async def commands_reference() -> dict[str, Any]:
+    """返回常用运维命令列表，前端可直接展示为可复制的命令卡片。"""
+    commands = [
+        {
+            "category": "启动/停止",
+            "commands": [
+                {"label": "启动所有服务", "cmd": "docker compose up -d", "description": "后台启动所有 compose 服务"},
+                {
+                    "label": "停止所有服务",
+                    "cmd": "docker compose down",
+                    "description": "停止并移除所有容器（保留数据卷）",
+                },
+                {"label": "重启后端", "cmd": "docker compose restart backend", "description": "仅重启后端容器"},
+                {"label": "重新构建并启动", "cmd": "docker compose up -d --build", "description": "重新构建镜像后启动"},
+            ],
+        },
+        {
+            "category": "日志查看",
+            "commands": [
+                {"label": "查看后端日志", "cmd": "docker compose logs -f backend", "description": "实时跟踪后端日志"},
+                {"label": "查看前端日志", "cmd": "docker compose logs -f frontend", "description": "实时跟踪前端日志"},
+                {"label": "查看所有日志", "cmd": "docker compose logs -f", "description": "实时跟踪所有服务日志"},
+                {
+                    "label": "最近 100 行",
+                    "cmd": "docker compose logs --tail=100 backend",
+                    "description": "查看后端最近 100 行日志",
+                },
+            ],
+        },
+        {
+            "category": "健康检查",
+            "commands": [
+                {"label": "服务状态", "cmd": "docker compose ps", "description": "查看所有服务运行状态"},
+                {
+                    "label": "健康详情",
+                    "cmd": "curl -s http://localhost:8000/health | python -m json.tool",
+                    "description": "查看详细健康检查 JSON",
+                },
+                {
+                    "label": "系统指标",
+                    "cmd": "curl -s http://localhost:8000/metrics | python -m json.tool",
+                    "description": "查看系统运行指标",
+                },
+            ],
+        },
+        {
+            "category": "数据管理",
+            "commands": [
+                {
+                    "label": "查看数据卷",
+                    "cmd": "docker volume ls | grep conclave",
+                    "description": "列出所有 Conclave 数据卷",
+                },
+                {
+                    "label": "备份数据库",
+                    "cmd": "docker compose exec postgres pg_dump -U conclave conclave > backup.sql",
+                    "description": "导出 PostgreSQL 数据库",
+                },
+                {
+                    "label": "恢复数据库",
+                    "cmd": "cat backup.sql | docker compose exec -T postgres psql -U conclave conclave",
+                    "description": "从 SQL 文件恢复数据库",
+                },
+                {
+                    "label": "清理数据（危险）",
+                    "cmd": "docker compose down -v",
+                    "description": "停止并删除所有数据卷（不可恢复！）",
+                },
+            ],
+        },
+        {
+            "category": "调试",
+            "commands": [
+                {
+                    "label": "进入后端容器",
+                    "cmd": "docker compose exec backend bash",
+                    "description": "在后端容器内打开 Shell",
+                },
+                {
+                    "label": "进入数据库",
+                    "cmd": "docker compose exec postgres psql -U conclave",
+                    "description": "打开 psql 交互式终端",
+                },
+                {
+                    "label": "查看容器资源",
+                    "cmd": "docker stats --no-stream",
+                    "description": "查看所有容器的 CPU/内存使用",
+                },
+                {
+                    "label": "检查网络",
+                    "cmd": "docker network inspect conclave-dev_conclave-internal",
+                    "description": "查看内部网络详情",
+                },
+            ],
+        },
+    ]
+    return {"commands": commands}
+
+
+# ═══════════════════════════════════════════════════
+# ─── 参数化路由（/{host_id}/...）必须在静态路由之后 ──
+# ═══════════════════════════════════════════════════
+
+
+@router.get("/{host_id}")
+async def get_host(host_id: int) -> dict[str, Any]:
+    """获取单个主机详情。"""
+    async with async_session_factory() as session:
+        host = await _get_host_with_access(session, host_id)
+    return _model_to_response(host)
+
+
+@router.put("/{host_id}")
+async def update_host(host_id: int, body: DockerHostUpdate) -> dict[str, Any]:
+    """更新 Docker 主机。"""
+    async with async_session_factory() as session:
+        host = await _get_host_with_access(session, host_id, for_write=True)
+
+        update_data = body.model_dump(exclude_unset=True)
+        secret_fields = {"ssh_password", "ssh_key_content"}
+        secret_updates = {k: v for k, v in update_data.items() if k in secret_fields}
+        base_updates = {k: v for k, v in update_data.items() if k not in secret_fields}
+
+        for k, v in base_updates.items():
+            setattr(host, k, v)
+
+        tid = current_tenant_id()
+        if base_updates.get("is_default"):
+            others = (
+                (
+                    await session.execute(
+                        select(DockerHostModel).where(
+                            DockerHostModel.id != host_id,
+                            DockerHostModel.is_default == True,  # noqa: E712
+                            _tenant_filter_for_update() if tid is not None else DockerHostModel.tenant_id.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for h in others:
+                h.is_default = False
+
+        if secret_updates:
+            secret = (
+                await session.execute(select(DockerHostSecretModel).where(DockerHostSecretModel.host_id == host_id))
+            ).scalar_one_or_none()
+            if not secret:
+                secret = DockerHostSecretModel(host_id=host_id)
+                session.add(secret)
+            for k, v in secret_updates.items():
+                setattr(secret, k, v)
+
+        host.updated_at = datetime.now(timezone.utc)
+        await session.commit()
+        await session.refresh(host)
+
+    return _model_to_response(host)
+
+
+@router.delete("/{host_id}")
+async def delete_host(host_id: int) -> dict[str, Any]:
+    """删除 Docker 主机。"""
+    async with async_session_factory() as session:
+        host = await _get_host_with_access(session, host_id, for_write=True)
+        # 删除关联 secret
+        secret = (
+            await session.execute(select(DockerHostSecretModel).where(DockerHostSecretModel.host_id == host_id))
+        ).scalar_one_or_none()
+        if secret:
+            await session.delete(secret)
+        await session.delete(host)
+        await session.commit()
+    return {"ok": True, "deleted": host_id}
+
+
+# ─── 主机健康检查 ────────────────────────────────────
+@router.post("/{host_id}/health-check")
+async def health_check_host(host_id: int) -> dict[str, Any]:
+    """对指定主机执行健康检查。"""
+    async with async_session_factory() as session:
+        host = await _get_host_with_access(session, host_id)
+        secret = (
+            await session.execute(select(DockerHostSecretModel).where(DockerHostSecretModel.host_id == host_id))
+        ).scalar_one_or_none()
+
+        config = _model_to_config_dict(host, secret)
+
+    # 异步执行健康检查（避免阻塞）
+    health = await check_host_health(config)
+
+    # 更新状态
+    async with async_session_factory() as session:
+        host_refreshed: DockerHostModel | None = await session.get(DockerHostModel, host_id)
+        if host_refreshed:
+            host_refreshed.health_status = "healthy" if health.ok else "unhealthy"
+            host_refreshed.last_health_check = datetime.now(timezone.utc)
+            host_refreshed.docker_version = health.docker_version
+            host_refreshed.running_containers = health.running_containers
+            host_refreshed.total_containers = health.total_containers
+            host_refreshed.last_error = health.error
+            if health.cpu_count and not host_refreshed.cpu_cores:
+                host_refreshed.cpu_cores = health.cpu_count
+            if health.memory_total_gb and not host_refreshed.memory_gb:
+                host_refreshed.memory_gb = int(health.memory_total_gb)
+            await session.commit()
+            await session.refresh(host_refreshed)
+            return {
+                **_model_to_response(host_refreshed),
+                "health_detail": {
+                    "ok": health.ok,
+                    "latency_ms": health.latency_ms,
+                    "cpu_count": health.cpu_count,
+                    "memory_gb": health.memory_total_gb,
+                    "error": health.error,
+                },
+            }
+
+    return {"ok": False, "error": "更新失败"}
+
+
 # ─── 主机上的容器列表 ────────────────────────────────
 @router.get("/{host_id}/containers")
 async def list_containers(host_id: int) -> dict[str, Any]:
@@ -614,3 +910,58 @@ async def list_containers(host_id: int) -> dict[str, Any]:
                 }
             )
     return {"ok": True, "containers": containers, "host": host.name}
+
+
+# ─── 容器控制（停止/启动/重启/暂停/恢复）──────────────
+class ContainerActionRequest(BaseModel):
+    action: str = Field(..., pattern="^(stop|start|restart|pause|unpause|kill)$")
+    timeout: int = Field(default=10, ge=1, le=120)
+
+
+@router.post("/{host_id}/containers/{container_id}/action")
+async def container_action(host_id: int, container_id: str, body: ContainerActionRequest) -> dict[str, Any]:
+    """对指定容器执行操作：stop/start/restart/pause/unpause/kill。
+
+    安全约束：
+    - 需要租户访问权限
+    - 操作记录审计日志
+    - 不允许操作非 conclave 前缀的容器（防止误操作宿主机其他服务）
+    """
+    async with async_session_factory() as session:
+        host = await _get_host_with_access(session, host_id, for_write=True)
+        secret = (
+            await session.execute(select(DockerHostSecretModel).where(DockerHostSecretModel.host_id == host_id))
+        ).scalar_one_or_none()
+        config = _model_to_config_dict(host, secret)
+
+    # 安全检查：只允许操作 conclave 相关容器
+    rc, stdout, stderr = await run_docker_cmd(
+        ["ps", "-a", "--filter", f"id={container_id}", "--format", "{{.Names}}"],
+        host_config=config,
+        timeout=10,
+    )
+    if rc != 0 or not stdout.strip():
+        raise HTTPException(404, f"容器 {container_id[:12]} 不存在")
+
+    container_name = stdout.strip()
+    if not container_name.startswith("conclave"):
+        raise HTTPException(403, "只允许操作 Conclave 管理的容器")
+
+    # 执行操作
+    rc, stdout, stderr = await run_docker_cmd(
+        [body.action, container_id],
+        host_config=config,
+        timeout=body.timeout,
+    )
+
+    from app.observability.audit import audit
+
+    audit(
+        f"docker.container_{body.action}",
+        "success" if rc == 0 else "failure",
+        {"container": container_name, "host": host.name},
+    )
+
+    if rc != 0:
+        return {"ok": False, "error": stderr, "container": container_name, "action": body.action}
+    return {"ok": True, "container": container_name, "action": body.action}

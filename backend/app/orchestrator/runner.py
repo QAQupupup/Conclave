@@ -9,8 +9,10 @@ import time
 from datetime import datetime, timezone
 
 from app.config import settings
-from app.db_legacy import save_meeting, save_message
+from app.dao.meeting_dao import save_meeting
+from app.dao.message_dao import save_message
 from app.events import bus, make_event
+from app.lazy_asyncio import LazyLock
 from app.logging_config import get_logger
 from app.models import MeetingState, MeetingStatus, Stage
 from app.observability.log_bus import log_bus
@@ -24,7 +26,11 @@ from app.orchestrator.instant import (
 )
 from app.orchestrator.manager import MeetingManager
 from app.orchestrator.nodes import _inc_loop_count, _let_borrowed_agents_speak, decide_next_stage
-from conclave_core.state import STAGE_ORDER, is_terminal, should_pause
+from app.services.artifact_service import publish_and_notify
+from app.services.knowledge_graph import materialize_meeting_knowledge
+from conclave_core.state import STAGE_ORDER, is_terminal, should_pause  # noqa: F401 (STAGE_ORDER kept for fallback)
+
+from .workflow_templates import get_stage_sequence
 
 logger = get_logger("orchestrator.runner")
 
@@ -46,7 +52,7 @@ async def _process_interventions(state: MeetingState) -> MeetingState:
     对于每条 signal=intervene 且未处理的 injected_message，
     调用 LLM 生成主持人的简短回复，追加到 intervention_messages 中。
 
-    [CON-15 修复] 增加 per-meeting asyncio.Lock 防止并发处理同一会议时：
+    [CON-15 修复] 增加 per-meeting LazyLock 防止并发处理同一会议时：
     - 同一介入消息被处理两次（重复回复）
     - intervention_messages 列表被并发修改
     [CON-22 修复] 用户内容在喂给 LLM 前做 prompt 注入检测与隔离包装
@@ -65,7 +71,7 @@ async def _process_interventions(state: MeetingState) -> MeetingState:
 
     # [CON-15] per-meeting 锁，作用域为本次 _process_interventions 调用
     # 嵌套 acquire 需 RLock。同一会议并发触发时只让一个先进入处理循环。
-    lock = _intervention_locks.setdefault(state.meeting_id, asyncio.Lock())
+    lock = _intervention_locks.setdefault(state.meeting_id, LazyLock())
     async with lock:
         # 重新过滤一次：等待锁期间其他协程可能已经处理
         unprocessed = [
@@ -175,7 +181,7 @@ async def _process_interventions(state: MeetingState) -> MeetingState:
 
 
 # [CON-15] per-meeting 介入处理锁
-_intervention_locks: dict[str, asyncio.Lock] = {}
+_intervention_locks: dict[str, LazyLock] = {}
 
 
 class Runner:
@@ -232,20 +238,54 @@ class Runner:
 
         # ===== 模型快照：在运行开始时 resolve 所有角色/阶段的最终模型 =====
         # 运行时 LLM 调用直接读取快照，不再动态 resolve，消除中途切模型的不确定性
-        if not state.resolved_models:
+        # resume 时如果 model_override 已变更（用户通过 control API 换了模型），重新 resolve
+        if not state.resolved_models or state.resolved_from_model_override != state.model_override:
             try:
                 from app.llm_providers import resolve_models_for_meeting
+
+                old_models = state.resolved_models
+                # 从系统配置读取阶段模型覆盖（admin 通过 UI 配置的 stage_model_*）
+                stage_overrides = None
+                try:
+                    from app.services.config_service import get_cached_system_settings
+
+                    sys_cfg = get_cached_system_settings()
+                    _stage_keys = {
+                        "stage_model_clarify": "@clarify",
+                        "stage_model_intra_team": "@intra_team",
+                        "stage_model_cross_team": "@cross_team",
+                        "stage_model_evidence_check": "@evidence_check",
+                        "stage_model_arbitrate": "@arbitrate",
+                        "stage_model_produce": "@produce",
+                    }
+                    _overrides = {}
+                    for _cfg_key, _stage_key in _stage_keys.items():
+                        _val = sys_cfg.get(_cfg_key, "")
+                        if _val:
+                            _overrides[_stage_key] = _val
+                    if _overrides:
+                        stage_overrides = _overrides
+                except Exception:
+                    pass
 
                 state.resolved_models = resolve_models_for_meeting(
                     role_configs=state.role_configs,
                     meeting_model=state.model_override,
-                    stage_overrides=None,  # 阶段覆盖预留，暂未开放
+                    stage_overrides=stage_overrides,
                 )
-                log_bus.info(
-                    f"模型快照完成: {len(state.resolved_models)} 个角色/阶段",
-                    logger="orchestrator.runner",
-                    extra={"resolved_models": state.resolved_models},
-                )
+                state.resolved_from_model_override = state.model_override
+                if old_models and old_models != state.resolved_models:
+                    log_bus.info(
+                        f"模型快照已更新（model_override 变更）: {len(state.resolved_models)} 个角色/阶段",
+                        logger="orchestrator.runner",
+                        extra={"resolved_models": state.resolved_models, "old_models": old_models},
+                    )
+                else:
+                    log_bus.info(
+                        f"模型快照完成: {len(state.resolved_models)} 个角色/阶段",
+                        logger="orchestrator.runner",
+                        extra={"resolved_models": state.resolved_models},
+                    )
             except Exception as e:
                 log_bus.warning(f"模型快照失败（将回退到动态 resolve）: {e}", logger="orchestrator.runner")
         # --- Instant 模式分流 ---
@@ -259,7 +299,43 @@ class Runner:
             state.flow_plan = FLOW_INSTANT
             logger.info("会议 %s 使用即时模式（flow_plan=%s 已预设）", state.meeting_id, state.flow_plan)
         else:
-            intent = await classify_intent_async(state.topic, override_mode=state.flow_plan)
+            try:
+                intent = await classify_intent_async(state.topic, override_mode=state.flow_plan)
+            except Exception as intent_exc:
+                # 余额不足时暂停会议（classify_intent_async 在 try 块外，需单独处理）
+                from app.core.exceptions import InsufficientBalanceError
+
+                if isinstance(intent_exc, InsufficientBalanceError):
+                    logger.warning(f"会议 {state.meeting_id} 意图分流阶段 API 余额不足: {intent_exc}")
+                    state.paused_snapshot = state.snapshot()
+                    state.status = MeetingStatus.PAUSED
+                    state.error_detail = f"API 余额不足，会议已暂停: {str(intent_exc)[:500]}"
+                    state.checkpoint = {
+                        "failed_stage": "classify_intent",
+                        "failed_at": datetime.now(timezone.utc).isoformat(),
+                        "error": str(intent_exc)[:1000],
+                        "pause_reason": "insufficient_balance",
+                        "resumable": True,
+                    }
+                    await self._persist(state)
+                    await bus.publish(
+                        make_event(
+                            "meeting.paused",
+                            state.meeting_id,
+                            {
+                                "stage": "classify_intent",
+                                "reason": "insufficient_balance",
+                                "message": "API 余额不足，会议已暂停，充值后可恢复",
+                                "resumable": True,
+                            },
+                        )
+                    )
+                    reset_meeting_id(mid_token)
+                    reset_runner_session_id(rsid_token)
+                    if rid_token is not None:
+                        reset_request_id(rid_token)
+                    return state
+                raise
             if intent == FLOW_INSTANT or intent == "simple":
                 use_instant = True
                 state.flow_plan = FLOW_INSTANT
@@ -276,6 +352,40 @@ class Runner:
             try:
                 state = await run_instant(state.topic, state)
             except Exception as exc:
+                # 余额不足时暂停会议（而非 FAILED），允许用户充值后 resume
+                from app.core.exceptions import InsufficientBalanceError
+
+                if isinstance(exc, InsufficientBalanceError):
+                    logger.warning(f"会议 {state.meeting_id} 即时模式 API 余额不足: {exc}")
+                    state.paused_snapshot = state.snapshot()
+                    state.status = MeetingStatus.PAUSED
+                    state.error_detail = f"API 余额不足，会议已暂停: {str(exc)[:500]}"
+                    state.checkpoint = {
+                        "failed_stage": "instant",
+                        "failed_at": datetime.now(timezone.utc).isoformat(),
+                        "error": str(exc)[:1000],
+                        "pause_reason": "insufficient_balance",
+                        "resumable": True,
+                    }
+                    await self._persist(state)
+                    await bus.publish(
+                        make_event(
+                            "meeting.paused",
+                            state.meeting_id,
+                            {
+                                "stage": "instant",
+                                "reason": "insufficient_balance",
+                                "message": "API 余额不足，会议已暂停，充值后可恢复",
+                                "resumable": True,
+                            },
+                        )
+                    )
+                    reset_meeting_id(mid_token)
+                    reset_runner_session_id(rsid_token)
+                    if rid_token is not None:
+                        reset_request_id(rid_token)
+                    return state
+
                 logger.error("即时模式异常: %s", exc, exc_info=True)
                 state.status = MeetingStatus.FAILED
                 state.error_detail = str(exc)[:2000]
@@ -322,6 +432,50 @@ class Runner:
                 try:
                     state = await self.manager.run_stage(state, current_stage.value)
                 except Exception as stage_exc:
+                    # === 余额不足：暂停会议（PAUSED），等待用户充值后 resume ===
+                    # 不重试（余额为 0 时重试必然失败），不标记 FAILED（可恢复）
+                    from app.core.exceptions import InsufficientBalanceError
+
+                    if isinstance(stage_exc, InsufficientBalanceError):
+                        stage_name = current_stage.value
+                        logger.warning(
+                            f"会议 {state.meeting_id} 阶段 {stage_name} 因 API 余额不足暂停: {stage_exc}",
+                        )
+                        log_bus.warning(
+                            f"API 余额不足，会议暂停: stage={stage_name}",
+                            logger="orchestrator.runner",
+                            extra={
+                                "meeting_id": state.meeting_id,
+                                "stage": stage_name,
+                                "error": str(stage_exc)[:500],
+                                "pause_reason": "insufficient_balance",
+                            },
+                        )
+                        state.paused_snapshot = state.snapshot()
+                        state.status = MeetingStatus.PAUSED
+                        state.error_detail = f"API 余额不足，会议已暂停: {str(stage_exc)[:500]}"
+                        state.checkpoint = {
+                            "failed_stage": stage_name,
+                            "failed_at": datetime.now(timezone.utc).isoformat(),
+                            "error": str(stage_exc)[:1000],
+                            "pause_reason": "insufficient_balance",
+                            "resumable": True,
+                        }
+                        await self._persist(state)
+                        await bus.publish(
+                            make_event(
+                                "meeting.paused",
+                                state.meeting_id,
+                                {
+                                    "stage": stage_name,
+                                    "reason": "insufficient_balance",
+                                    "message": "API 余额不足，会议已暂停，充值后可恢复",
+                                    "resumable": True,
+                                },
+                            )
+                        )
+                        return state
+
                     # === 断点续传：阶段失败时不直接标记FAILED，而是记录checkpoint并重试 ===
                     import traceback
 
@@ -432,11 +586,132 @@ class Runner:
                     extra={"stage": current_stage.value, "messages_count": len(state.messages)},
                 )
 
+                # === 中间阶段退化检测 ===
+                # 在 persist 之后、子议题逻辑之前检查退化指标
+                # 不触发迭代，仅记录结构化告警到 state.degradation_warnings
+                if current_stage in self._INTERMEDIATE_STAGES and not is_terminal(state):
+                    await self._check_intermediate_degradation(state, current_stage)
+                    if state.degradation_warnings:
+                        await self._persist(state)  # 持久化新增的告警
+
+                # === ADR-014 Phase 3: 子议题迭代 ===
+                # produce 完成后，若处于子议题模式，保存当前子议题结果并切换到下一个
+                if (
+                    current_stage == Stage.PRODUCE
+                    and state.topic_decomposition is not None
+                    and state.current_subtopic_idx >= 0
+                    and not is_terminal(state)
+                ):
+                    from app.orchestrator.result_aggregator import build_aggregation_context
+                    from app.orchestrator.topic_decomposer import TopicDecomposition
+
+                    decomposition = TopicDecomposition(**state.topic_decomposition)
+                    subtopic_count = len(decomposition.subtopics)
+                    current_idx = state.current_subtopic_idx
+                    current_subtopic = decomposition.subtopics[current_idx]
+
+                    # 保存当前子议题的产出
+                    state.subtopic_results.append(
+                        {
+                            "subtopic_id": current_subtopic.id,
+                            "title": current_subtopic.title,
+                            "result": {
+                                "artifact": state.artifact,
+                                "decisions": state.decision_record,
+                            },
+                        }
+                    )
+                    logger.info(
+                        "会议 %s 子议题 %d/%d (%s) 完成，保存结果",
+                        state.meeting_id,
+                        current_idx + 1,
+                        subtopic_count,
+                        current_subtopic.title,
+                    )
+
+                    if current_idx + 1 < subtopic_count:
+                        # 还有更多子议题，切换到下一个
+                        next_idx = current_idx + 1
+                        next_subtopic = decomposition.subtopics[next_idx]
+                        state.current_subtopic_idx = next_idx
+                        state.workflow_template = next_subtopic.workflow_template
+
+                        # 重置辩论数据（保留 messages 供上下文参考）
+                        state.claims = []
+                        state.conflicts = []
+                        state.team_conclusions = []
+                        state.evidence_set = []
+                        state.decision_record = None
+                        state.artifact = None
+                        state.gate_history = []
+                        state.gate_pending_action = None
+                        state.prefetched_evidence = None
+                        state.iteration_count = 0
+                        state.quality_score = None
+                        state.quality_feedback = None
+                        state.quality_evaluation = None
+
+                        # 设置下一阶段为 intra_team（子议题的起始阶段）
+                        state.stage = Stage.INTRA_TEAM
+
+                        await bus.publish(
+                            make_event(
+                                "subtopic.switched",
+                                state.meeting_id,
+                                {
+                                    "subtopic_idx": next_idx,
+                                    "subtopic_title": next_subtopic.title,
+                                    "workflow_template": next_subtopic.workflow_template,
+                                },
+                            )
+                        )
+                        await self._persist(state)
+                        continue  # 跳过质量门禁，直接执行下一个子议题
+                    else:
+                        # 所有子议题完成，构建聚合上下文
+                        logger.info(
+                            "会议 %s 所有 %d 个子议题完成，开始聚合最终产出",
+                            state.meeting_id,
+                            subtopic_count,
+                        )
+                        aggregation_ctx = build_aggregation_context(
+                            decomposition,
+                            state.subtopic_results,
+                        )
+                        # 将聚合上下文追加到 reference_context
+                        if state.reference_context:
+                            state.reference_context += "\n" + aggregation_ctx
+                        else:
+                            state.reference_context = aggregation_ctx
+
+                        state.current_subtopic_idx = -1  # 退出子议题模式
+                        # 重置辩论数据，让最终 produce 基于聚合上下文生成
+                        state.claims = []
+                        state.conflicts = []
+                        state.team_conclusions = []
+                        state.evidence_set = []
+                        state.decision_record = None
+                        state.artifact = None
+                        state.stage = Stage.PRODUCE  # 最终 produce
+
+                        await bus.publish(
+                            make_event(
+                                "subtopic.aggregated",
+                                state.meeting_id,
+                                {
+                                    "subtopic_count": subtopic_count,
+                                    "strategy": decomposition.aggregation_strategy,
+                                },
+                            )
+                        )
+                        await self._persist(state)
+
                 # === 自我迭代 Loop：produce完成后评估质量，不达标则触发迭代 ===
                 if current_stage == Stage.PRODUCE and not is_terminal(state):
                     quality_result = await self._evaluate_quality(state)
                     state.quality_score = quality_result.get("score", 0)
                     state.quality_feedback = quality_result.get("feedback", "")
+                    state.quality_evaluation = quality_result  # 完整 8 维评分明细
                     should_iterate = quality_result.get("should_iterate", False)
                     log_bus.info(
                         f"质量门禁评估: score={state.quality_score}, should_iterate={should_iterate}, "
@@ -494,6 +769,8 @@ class Runner:
                         continue  # 重新执行produce阶段
                     elif should_iterate and not state.auto_iterate:
                         # 用户未开启auto_iterate，标记为需要人工确认
+                        # [P0-2 修复] 仍需设置终态 DONE，否则 while 循环会无限重跑 produce
+                        # 前端通过 quality.needs_review 事件提示用户可手动触发迭代
                         await bus.publish(
                             make_event(
                                 "quality.needs_review",
@@ -504,6 +781,34 @@ class Runner:
                                     "can_iterate": state.iteration_count < state.max_iterations,
                                 },
                             )
+                        )
+                        state.status = MeetingStatus.DONE
+                        state.completed_at = datetime.now(timezone.utc)
+                        # [GraphRAG-lite] 会议 DONE：物化冲突/证据图谱边 + 议题向量 + 惰性实体抽取
+                        await materialize_meeting_knowledge(state)
+                        # 注：质量未达标（需人工确认）不发布产物——
+                        # ADR-017 D2 要求门禁通过才 publish，避免劣质产物流入下游
+                        log_bus.info(
+                            f"质量未达标但 auto_iterate=False，设置终态 DONE（需人工确认）: "
+                            f"score={state.quality_score}, iterations={state.iteration_count}",
+                            logger="orchestrator.runner",
+                        )
+                    else:
+                        # [P0-2 修复] 质量门禁通过或达到迭代上限：设置终态
+                        # 覆盖两种情况：
+                        #   1. should_iterate=False（质量达标）
+                        #   2. should_iterate=True but iteration_count >= max_iterations（迭代上限）
+                        state.status = MeetingStatus.DONE
+                        state.completed_at = datetime.now(timezone.utc)
+                        # [GraphRAG-lite] 会议 DONE：物化冲突/证据图谱边 + 议题向量 + 惰性实体抽取
+                        await materialize_meeting_knowledge(state)
+                        # ADR-017 Phase 1: Publish 产物入 artifacts 表
+                        # （单向幂等；失败仅记日志，不阻断终态）
+                        await publish_and_notify(state)
+                        log_bus.info(
+                            f"质量门禁通过/迭代结束，设置终态 DONE: "
+                            f"score={state.quality_score}, iterations={state.iteration_count}",
+                            logger="orchestrator.runner",
                         )
 
                 # 终止判断
@@ -530,8 +835,10 @@ class Runner:
                     _regression_count = int(getattr(state, "_regression_count", 0))
 
                     if next_stage != old_stage and next_stage != Stage.PRODUCE:
-                        from_idx = STAGE_ORDER.index(old_stage) if old_stage in STAGE_ORDER else -1
-                        to_idx = STAGE_ORDER.index(next_stage) if next_stage in STAGE_ORDER else -1
+                        # ADR-014 Phase 2: 使用工作流模板的阶段序列进行回退检测
+                        _wf_stages = get_stage_sequence(state.workflow_template)
+                        from_idx = _wf_stages.index(old_stage) if old_stage in _wf_stages else -1
+                        to_idx = _wf_stages.index(next_stage) if next_stage in _wf_stages else -1
                         if to_idx < from_idx and from_idx >= 0 and to_idx >= 0:
                             # 回退转移
                             _regression_count += 1
@@ -593,24 +900,53 @@ class Runner:
         # [AUDIT-FIX P0-2/P0-4] 异常兜底：节点抛出未捕获异常时，
         # 将状态置为 FAILED 而非遗留 RUNNING 僵死态，并记录 error_detail
         except Exception as exc:
-            logger.error("会议 %s 节点执行异常: %s", state.meeting_id, exc, exc_info=True)
-            log_bus.error(
-                f"Runner 异常终止: {exc}",
-                logger="orchestrator.runner",
-                extra={
-                    "meeting_id": state.meeting_id,
-                    "runner_session_id": rsid,
-                    "stage": state.stage.value,
-                    "error": str(exc)[:500],
-                },
-            )
-            state.status = MeetingStatus.FAILED
-            state.error_detail = str(exc)[:2000]
-            from datetime import datetime as _dt
-            from datetime import timezone as _tz
+            # 余额不足：暂停会议（PAUSED），覆盖介入处理/借调发言等非阶段执行路径
+            from app.core.exceptions import InsufficientBalanceError
 
-            state.completed_at = _dt.now(_tz.utc)
-            await self._persist(state)
+            if isinstance(exc, InsufficientBalanceError):
+                logger.warning(f"会议 {state.meeting_id} 阶段外 API 余额不足: {exc}")
+                state.paused_snapshot = state.snapshot()
+                state.status = MeetingStatus.PAUSED
+                state.error_detail = f"API 余额不足，会议已暂停: {str(exc)[:500]}"
+                state.checkpoint = {
+                    "failed_stage": state.stage.value,
+                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                    "error": str(exc)[:1000],
+                    "pause_reason": "insufficient_balance",
+                    "resumable": True,
+                }
+                await self._persist(state)
+                await bus.publish(
+                    make_event(
+                        "meeting.paused",
+                        state.meeting_id,
+                        {
+                            "stage": state.stage.value,
+                            "reason": "insufficient_balance",
+                            "message": "API 余额不足，会议已暂停，充值后可恢复",
+                            "resumable": True,
+                        },
+                    )
+                )
+            else:
+                logger.error("会议 %s 节点执行异常: %s", state.meeting_id, exc, exc_info=True)
+                log_bus.error(
+                    f"Runner 异常终止: {exc}",
+                    logger="orchestrator.runner",
+                    extra={
+                        "meeting_id": state.meeting_id,
+                        "runner_session_id": rsid,
+                        "stage": state.stage.value,
+                        "error": str(exc)[:500],
+                    },
+                )
+                state.status = MeetingStatus.FAILED
+                state.error_detail = str(exc)[:2000]
+                from datetime import datetime as _dt
+                from datetime import timezone as _tz
+
+                state.completed_at = _dt.now(_tz.utc)
+                await self._persist(state)
 
         logger.info("会议 %s 运行结束: stage=%s, status=%s", state.meeting_id, state.stage.value, state.status.value)
         # 旁路日志：记录 runner session 结束（因果链终点）
@@ -637,8 +973,216 @@ class Runner:
 
         return state
 
+    # ── 中间阶段退化检测 ──
+    # 不触发迭代（成本太高），仅记录结构化告警到 state.degradation_warnings，
+    # 供审计端点导出和根因分析使用。
+
+    _INTERMEDIATE_STAGES: frozenset[Stage] = frozenset(
+        {
+            Stage.INTRA_TEAM,
+            Stage.CROSS_TEAM,
+            Stage.EVIDENCE_CHECK,
+            Stage.ARBITRATE,
+        }
+    )
+
+    async def _check_intermediate_degradation(self, state: MeetingState, completed_stage: Stage) -> None:
+        """中间阶段完成后检查退化指标，记录结构化告警。
+
+        检查维度：
+        - intra_team: claim 类型多样性（同质化退化）、claim 数量过少
+        - cross_team: 冲突数量异常（0 冲突可能意味着角色观点趋同）
+        - evidence_check: 证据覆盖率过低
+        - arbitrate: 决策记录缺失
+        """
+        if completed_stage not in self._INTERMEDIATE_STAGES:
+            return
+
+        stage_name = completed_stage.value
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if completed_stage == Stage.INTRA_TEAM:
+            # claim 类型多样性检查
+            type_dist: dict[str, int] = {}
+            for concl in state.team_conclusions:
+                for c in concl.get("claims", []):
+                    t = c.get("type", "unknown")
+                    type_dist[t] = type_dist.get(t, 0) + 1
+            total_claims = sum(type_dist.values())
+            distinct_types = len(type_dist)
+
+            if total_claims > 0 and distinct_types < 2:
+                state.degradation_warnings.append(
+                    {
+                        "stage": stage_name,
+                        "warning_type": "claim_type_homogenization",
+                        "detail": f"所有 {total_claims} 条 claim 均为同一类型 {list(type_dist.keys())}，"
+                        f"缺乏事实/假设/约束的多样性区分",
+                        "type_distribution": type_dist,
+                        "total_claims": total_claims,
+                        "timestamp": now_iso,
+                        "severity": "high",
+                    }
+                )
+            elif total_claims > 0 and distinct_types == 2 and total_claims >= 6:
+                # 2 种类型但有大量 claim，可能有一种类型占比极高
+                max_ratio = max(type_dist.values()) / total_claims
+                if max_ratio > 0.85:
+                    state.degradation_warnings.append(
+                        {
+                            "stage": stage_name,
+                            "warning_type": "claim_type_imbalance",
+                            "detail": f"类型分布严重不均：{type_dist}，"
+                            f"主导类型占比 {max_ratio:.0%}，可能导致论证视角单一",
+                            "type_distribution": type_dist,
+                            "total_claims": total_claims,
+                            "timestamp": now_iso,
+                            "severity": "medium",
+                        }
+                    )
+
+            # claim 数量过少检查（每个角色至少应有 1 条 claim）
+            expected_min = max(len(state.team_config), 2)
+            if 0 < total_claims < expected_min:
+                state.degradation_warnings.append(
+                    {
+                        "stage": stage_name,
+                        "warning_type": "insufficient_claims",
+                        "detail": f"仅产出 {total_claims} 条 claim，预期至少 {expected_min} 条"
+                        f"（{len(state.team_config)} 个角色）",
+                        "total_claims": total_claims,
+                        "expected_min": expected_min,
+                        "timestamp": now_iso,
+                        "severity": "medium",
+                    }
+                )
+
+        elif completed_stage == Stage.CROSS_TEAM:
+            # 冲突数量检查：0 冲突可能意味着角色观点趋同（退化信号）
+            conflict_count = len(state.conflicts)
+            claim_count = sum(len(c.get("claims", [])) for c in state.team_conclusions)
+            if claim_count >= 6 and conflict_count == 0:
+                state.degradation_warnings.append(
+                    {
+                        "stage": stage_name,
+                        "warning_type": "zero_conflicts",
+                        "detail": f"有 {claim_count} 条 claim 但未检测到任何冲突，角色观点可能过度趋同",
+                        "claim_count": claim_count,
+                        "conflict_count": conflict_count,
+                        "timestamp": now_iso,
+                        "severity": "medium",
+                    }
+                )
+
+        elif completed_stage == Stage.EVIDENCE_CHECK:
+            # 证据覆盖率检查
+            total_assessments = sum(len(es.get("assessments", [])) for es in state.evidence_set)
+            claim_count = sum(len(c.get("claims", [])) for c in state.team_conclusions)
+            if claim_count > 0 and total_assessments == 0:
+                state.degradation_warnings.append(
+                    {
+                        "stage": stage_name,
+                        "warning_type": "zero_evidence_assessments",
+                        "detail": f"有 {claim_count} 条 claim 但无任何证据评估，证据检查阶段可能未正常执行",
+                        "claim_count": claim_count,
+                        "assessment_count": total_assessments,
+                        "timestamp": now_iso,
+                        "severity": "high",
+                    }
+                )
+
+        elif completed_stage == Stage.ARBITRATE:
+            # 决策记录缺失检查
+            if not state.decision_record:
+                state.degradation_warnings.append(
+                    {
+                        "stage": stage_name,
+                        "warning_type": "missing_decision_record",
+                        "detail": "仲裁阶段完成但未生成决策记录",
+                        "timestamp": now_iso,
+                        "severity": "high",
+                    }
+                )
+
+        # 如果有告警，发布事件并记录日志
+        new_warnings = [w for w in state.degradation_warnings if w.get("timestamp") == now_iso]
+        for warning in new_warnings:
+            log_bus.warning(
+                f"中间阶段退化告警: stage={warning['stage']}, "
+                f"type={warning['warning_type']}, severity={warning['severity']}",
+                logger="orchestrator.runner",
+                extra={
+                    "meeting_id": state.meeting_id,
+                    "stage": warning["stage"],
+                    "warning_type": warning["warning_type"],
+                    "severity": warning["severity"],
+                },
+            )
+            await bus.publish(
+                make_event(
+                    "intermediate.degradation",
+                    state.meeting_id,
+                    {
+                        "stage": warning["stage"],
+                        "warning_type": warning["warning_type"],
+                        "severity": warning["severity"],
+                        "detail": warning["detail"][:300],
+                    },
+                )
+            )
+
     async def _evaluate_quality(self, state: MeetingState) -> dict:
-        """质量门禁评估：多维度评估产出物质量，决定是否需要迭代改进。
+        """质量门禁评估：按 deliverable_type 分派到对应评估方法。"""
+        dt = state.deliverable_type
+        if dt == "deployable_service":
+            return await self._evaluate_quality_deployable(state)
+        elif dt == "prd_openapi":
+            return await self._evaluate_quality_prd(state)
+        elif dt in (
+            "design_doc",
+            "comprehensive",
+            "research_report",
+            "business_report",
+            # ADR-017 Phase 1：新产出类型走文档评估（T1.7）
+            "feasibility_report",
+            "adr",
+        ):
+            return await self._evaluate_quality_document(state, dt)
+        elif dt in ("code_analysis", "data_science", "tested_system", "test_suite"):
+            return await self._evaluate_quality_code(state, dt)
+        else:
+            return await self._evaluate_quality_prd(state)
+
+    @staticmethod
+    def _build_quality_result(
+        score: int,
+        feedback_parts: list[str],
+        hard_failures: list[str],
+        should_iterate: bool,
+        metrics: dict | None = None,
+    ) -> dict:
+        """构建质量评估结果 dict（统一格式）。"""
+        all_feedback: list[str] = []
+        if hard_failures:
+            all_feedback.append("【必须修复】")
+            all_feedback.extend(f"- {h}" for h in hard_failures)
+        if feedback_parts:
+            all_feedback.append("【建议改进】")
+            all_feedback.extend(f"- {f}" for f in feedback_parts)
+        if not all_feedback and score >= 80:
+            all_feedback.append("质量评估通过，产出达到商用标准")
+        result: dict = {
+            "score": max(0, min(100, score)),
+            "feedback": "\n".join(all_feedback),
+            "should_iterate": should_iterate,
+            "hard_failures": hard_failures,
+        }
+        if metrics:
+            result["metrics"] = metrics
+        return result
+
+    async def _evaluate_quality_deployable(self, state: MeetingState) -> dict:
+        """质量门禁评估（deployable_service）：多维度评估产出物质量，决定是否需要迭代改进。
 
         评估维度（权重）：
         1. 部署成功（硬门槛）：部署失败直接不通过
@@ -904,27 +1448,315 @@ class Runner:
             "is_demo_suspected": total_files < 5 or total_lines < 200 or demo_hits >= 3,
         }
 
-    async def _persist(self, state: MeetingState) -> None:
-        """持久化会议状态与发言到 PostgreSQL
+    # ── 占位符检测（多类型共用）──
+    _PLACEHOLDER_PATTERNS = ("TODO", "placeholder", "示例", "stub", "待补充", "占位")
 
-        db_legacy 已迁移到 SQLAlchemy async，直接 await 即可，
-        不再需要 asyncio.to_thread 线程隔离。
+    def _count_placeholders(self, text: str) -> int:
+        """扫描文本中的占位符数量。"""
+        return sum(1 for p in self._PLACEHOLDER_PATTERNS if p in text)
+
+    async def _evaluate_quality_prd(self, state: MeetingState) -> dict:
+        """评估 prd_openapi 类型产出质量（总分 100）。"""
+        artifact = state.artifact or {}
+        prd = artifact.get("prd") if isinstance(artifact.get("prd"), dict) else {}
+        openapi = artifact.get("openapi") or ""
+
+        score = 0
+        feedback_parts: list[str] = []
+        hard_failures: list[str] = []
+
+        # 1. PRD 存在性（硬门槛 10 分）
+        if not isinstance(prd, dict) or not prd:
+            hard_failures.append("PRD 内容为空或格式错误")
+        else:
+            score += 10
+
+            # 2. PRD 字段完整性（35 分）
+            required_fields = {
+                "title": 5,
+                "goal": 5,
+                "scope": 5,
+                "api_endpoints": 5,
+                "constraints": 5,
+                "assumptions": 5,
+                "open_questions": 5,
+            }
+            field_score = 0
+            missing_fields: list[str] = []
+            for field, weight in required_fields.items():
+                val = prd.get(field)
+                if val:
+                    field_score += weight
+                else:
+                    missing_fields.append(field)
+            score += field_score
+            if missing_fields:
+                feedback_parts.append(f"PRD 缺少字段: {', '.join(missing_fields)}")
+
+        # 3. OpenAPI 规范质量（25 分）
+        if not openapi:
+            hard_failures.append("OpenAPI 规范为空")
+        else:
+            score += 10  # 非空基础分
+            if len(openapi) >= 100:
+                score += 5
+            if "paths:" in openapi:
+                score += 5
+            if "openapi:" in openapi:
+                score += 5
+
+        # 4. API 端点设计（20 分）
+        endpoints = prd.get("api_endpoints") or [] if isinstance(prd, dict) else []
+        valid_endpoints = [e for e in endpoints if isinstance(e, dict) and e.get("method") and e.get("path")]
+        score += min(len(valid_endpoints) * 5, 20)
+        if endpoints and not valid_endpoints:
+            feedback_parts.append("API 端点定义格式不正确（缺少 method/path）")
+
+        # 5. 内容真实性（10 分）
+        content = str(prd) + str(openapi)
+        placeholder_count = self._count_placeholders(content)
+        score -= placeholder_count * 3
+        if placeholder_count > 0:
+            feedback_parts.append(f"检测到 {placeholder_count} 处占位符内容")
+
+        score = max(0, min(100, score))
+        should_iterate = bool(hard_failures) or score < 60
+        return self._build_quality_result(
+            score=score,
+            feedback_parts=feedback_parts,
+            hard_failures=hard_failures,
+            should_iterate=should_iterate,
+            metrics={
+                "prd_fields": len(prd.keys()) if isinstance(prd, dict) else 0,
+                "openapi_length": len(openapi),
+                "valid_endpoints": len(valid_endpoints),
+                "placeholder_count": placeholder_count,
+            },
+        )
+
+    async def _evaluate_quality_document(self, state: MeetingState, dt: str) -> dict:
+        """评估文档类产出质量（design_doc/research_report/business_report/comprehensive/feasibility_report/adr，总分 100）。"""
+        artifact = state.artifact or {}
+        doc = artifact.get(dt) if isinstance(artifact.get(dt), dict) else {}
+
+        score = 0
+        feedback_parts: list[str] = []
+        hard_failures: list[str] = []
+
+        # 1. 文档存在性（硬门槛 10 分）
+        if not isinstance(doc, dict) or not doc:
+            hard_failures.append(f"{dt} 文档内容为空或格式错误")
+        else:
+            score += 10
+
+            # 2. 必需字段完整性（40 分）
+            required_fields_map = {
+                "design_doc": ["title", "overview", "architecture", "tech_stack", "data_model", "api_design"],
+                "research_report": ["title", "summary", "findings", "analysis", "recommendations"],
+                "business_report": [
+                    "title",
+                    "executive_summary",
+                    "market_analysis",
+                    "financial_projection",
+                    "risk_assessment",
+                ],
+                "comprehensive": ["title", "requirements", "system_design", "api_design", "data_model"],
+                # ADR-017 Phase 1：新产出类型必需字段（T1.7）
+                "feasibility_report": ["title", "summary", "verdict", "dimensions", "assumptions"],
+                "adr": ["title", "summary", "context", "decision_table", "alternatives_rejected"],
+            }
+            required = required_fields_map.get(dt, ["title", "summary"])
+            present = [f for f in required if doc.get(f)]
+            field_score = int(len(present) / len(required) * 40)
+            score += field_score
+            missing = [f for f in required if not doc.get(f)]
+            if missing:
+                feedback_parts.append(f"文档缺少字段: {', '.join(missing)}")
+
+            # 3. 内容深度（25 分）：各文本字段平均长度
+            text_fields = [str(v) for v in doc.values() if isinstance(v, str) and len(v) > 10]
+            if text_fields:
+                avg_len = sum(len(t) for t in text_fields) / len(text_fields)
+                depth_score = min(int(avg_len / 50 * 25), 25)
+                score += depth_score
+                if avg_len < 50:
+                    feedback_parts.append(f"文档内容偏短（平均 {avg_len:.0f} 字符/字段）")
+            else:
+                feedback_parts.append("文档缺少有深度的文本字段")
+
+            # 4. 结构完整性（15 分）：列表类字段有元素
+            list_fields = [v for v in doc.values() if isinstance(v, list)]
+            if list_fields:
+                non_empty_lists = sum(1 for lst in list_fields if len(lst) >= 1)
+                score += min(int(non_empty_lists / len(list_fields) * 15), 15)
+            else:
+                feedback_parts.append("文档缺少列表类结构化字段")
+
+        # 5. 内容真实性（10 分）
+        content = str(doc)
+        placeholder_count = self._count_placeholders(content)
+        score -= placeholder_count * 3
+        if placeholder_count > 0:
+            feedback_parts.append(f"检测到 {placeholder_count} 处占位符内容")
+
+        score = max(0, min(100, score))
+        should_iterate = bool(hard_failures) or score < 60
+        return self._build_quality_result(
+            score=score,
+            feedback_parts=feedback_parts,
+            hard_failures=hard_failures,
+            should_iterate=should_iterate,
+            metrics={
+                "doc_type": dt,
+                "doc_fields": len(doc.keys()) if isinstance(doc, dict) else 0,
+                "placeholder_count": placeholder_count,
+            },
+        )
+
+    async def _evaluate_quality_code(self, state: MeetingState, dt: str) -> dict:
+        """评估代码类产出质量（code_analysis/data_science/tested_system/test_suite，总分 100）。"""
+        artifact = state.artifact or {}
+        code_data = artifact.get(dt) if isinstance(artifact.get(dt), dict) else {}
+        execution = artifact.get("execution") or {}
+
+        score = 0
+        feedback_parts: list[str] = []
+        hard_failures: list[str] = []
+
+        # 1. 代码存在性（硬门槛 10 分）
+        if not code_data:
+            hard_failures.append(f"{dt} 产出为空")
+        else:
+            score += 10
+
+            # 2. 代码完整性（30 分）
+            if dt == "tested_system":
+                main_code = code_data.get("main_code") or ""
+                test_code = code_data.get("test_code") or ""
+                if main_code:
+                    score += 15
+                if test_code:
+                    score += 15
+                if not main_code and not test_code:
+                    hard_failures.append("tested_system 缺少 main_code 和 test_code")
+            elif dt == "test_suite":
+                # ADR-017 Phase 1（T1.7）：存在性看 test_files 非空 + run_instructions
+                test_files = code_data.get("test_files") or []
+                valid_files = [f for f in test_files if isinstance(f, dict) and f.get("path") and f.get("code")]
+                if valid_files:
+                    score += 20
+                else:
+                    hard_failures.append("test_suite 缺少有效的 test_files（需含 path 与 code）")
+                if code_data.get("run_instructions"):
+                    score += 10
+                else:
+                    feedback_parts.append("test_suite 缺少 run_instructions")
+            else:
+                code = code_data.get("code") or ""
+                if code:
+                    score += 30
+                else:
+                    hard_failures.append(f"{dt} 缺少 code 字段")
+
+            # 3. 执行结果（30 分）
+            exit_code = execution.get("exit_code")
+            if exit_code == 0:
+                score += 30
+                feedback_parts.append("代码执行成功")
+            elif execution.get("error"):
+                score += 10
+                feedback_parts.append(f"代码执行异常: {execution.get('error', '')[:80]}")
+            elif exit_code is not None:
+                # ADR-017 Phase 3（T3.3）：已执行但失败（exit_code 非 0 且无 error）。
+                # 修复前该情况落入「未执行」分支被误判；现按已执行失败计分并反馈失败数。
+                score += 10
+                test_report = artifact.get("test_report") or {}
+                if (
+                    dt == "test_suite"
+                    and isinstance(test_report, dict)
+                    and (test_report.get("passed") or test_report.get("failed"))
+                ):
+                    feedback_parts.append(
+                        f"测试执行未全部通过: {test_report.get('passed', 0)} 通过 / {test_report.get('failed', 0)} 失败"
+                    )
+                else:
+                    feedback_parts.append(f"代码执行失败（exit_code={exit_code}）")
+            elif dt == "test_suite":
+                # 未执行兜底：执行闭环已落地（Phase 3），仅沙箱不可用/路径全部被拒时进入
+                score += 15
+                feedback_parts.append("测试未执行（沙箱不可用或执行被跳过，按未执行扣分而非硬门槛）")
+            else:
+                feedback_parts.append("未检测到代码执行结果")
+
+            # 4. 代码规模（20 分）
+            all_code = ""
+            if dt == "tested_system":
+                all_code = (code_data.get("main_code") or "") + (code_data.get("test_code") or "")
+            elif dt == "test_suite":
+                all_code = "".join(
+                    str(f.get("code") or "") for f in (code_data.get("test_files") or []) if isinstance(f, dict)
+                )
+            else:
+                all_code = code_data.get("code") or ""
+            if len(all_code) >= 200:
+                score += 20
+            elif len(all_code) >= 100:
+                score += 10
+                feedback_parts.append(f"代码偏短（{len(all_code)} 字符）")
+            else:
+                feedback_parts.append(f"代码过短（{len(all_code)} 字符），疑似 stub")
+
+        # 5. 内容真实性（10 分）
+        content = str(code_data) + str(execution)
+        placeholder_count = self._count_placeholders(content)
+        score -= placeholder_count * 3
+        if placeholder_count > 0:
+            feedback_parts.append(f"检测到 {placeholder_count} 处占位符内容")
+
+        score = max(0, min(100, score))
+        should_iterate = bool(hard_failures) or score < 60
+        return self._build_quality_result(
+            score=score,
+            feedback_parts=feedback_parts,
+            hard_failures=hard_failures,
+            should_iterate=should_iterate,
+            metrics={
+                "code_type": dt,
+                "code_length": len(all_code) if code_data else 0,
+                "exit_code": execution.get("exit_code"),
+                "placeholder_count": placeholder_count,
+            },
+        )
+
+    async def _persist(self, state: MeetingState) -> None:
+        """持久化会议状态与发言到 PostgreSQL（原子事务）
+
+        使用单 session 包裹 save_meeting + save_meeting_aux + save_message，
+        保证三张表要么全部成功提交，要么全部回滚。
         """
-        from app.db_legacy import save_meeting_aux
+        from app.dao.meeting_aux_dao import save_meeting_aux
+        from app.db.engine import async_session_factory
 
         aux = state.extract_aux()
         try:
-            await save_meeting(
-                meeting_id=state.meeting_id,
-                topic=state.topic,
-                status=state.status.value,
-                stage=state.stage.value,
-                created_at=state.created_at,
-                payload=state.snapshot(),
-            )
-            await save_meeting_aux(state.meeting_id, aux)
-            for msg in state.messages:
-                await save_message(msg)
+            async with async_session_factory() as session:
+                try:
+                    await save_meeting(
+                        meeting_id=state.meeting_id,
+                        topic=state.topic,
+                        status=state.status.value,
+                        stage=state.stage.value,
+                        created_at=state.created_at,
+                        payload=state.snapshot(),
+                        session=session,
+                    )
+                    await save_meeting_aux(state.meeting_id, aux, session=session)
+                    for msg in state.messages:
+                        await save_message(msg, session=session)
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    raise
         finally:
             state.inject_aux(aux)
 
@@ -1028,7 +1860,7 @@ def clear_state(meeting_id: str) -> bool:
 
     同时清理：
     - _states 中的 MeetingState 对象
-    - _intervention_locks 中的 asyncio.Lock 对象
+    - _intervention_locks 中的 LazyLock 对象
 
     Returns:
         bool: 是否真的有状态被删除（True=删除成功，False=会议本就不在内存中）。
@@ -1123,13 +1955,14 @@ def new_state(meeting_id: str, topic: str, doc_summaries: list[str] | None = Non
 async def load_or_create(meeting_id: str, topic: str, doc_summaries: list[str] | None = None) -> MeetingState:
     """从内存取或新建运行态；内存未命中时从 PostgreSQL 恢复
 
-    db_legacy 已迁移到 SQLAlchemy async，直接 await 即可。
+    数据访问统一走 app.dao.* 子模块（SQLAlchemy async），直接 await 即可。
     """
     existing = get_state(meeting_id)
     if existing is not None:
         return existing
     # 尝试从 PostgreSQL 恢复
-    from app.db_legacy import get_meeting, get_meeting_aux
+    from app.dao.meeting_aux_dao import get_meeting_aux
+    from app.dao.meeting_dao import get_meeting
 
     record = await get_meeting(meeting_id)
     if record is not None:
@@ -1161,7 +1994,8 @@ async def recover_crashed_meetings() -> list[str]:
     重启后把它们标记为 paused，用户可以手动 resume 继续。
     返回被恢复的会议 ID 列表。
     """
-    from app.db_legacy import get_meeting_aux, recover_running_meetings, save_meeting_aux
+    from app.dao.meeting_aux_dao import get_meeting_aux, save_meeting_aux
+    from app.dao.meeting_dao import recover_running_meetings
     from app.models import MeetingStatus
     from app.observability.log_bus import log_bus
     from app.tenants import create_system_tenant_ctx

@@ -98,7 +98,7 @@ class InMemoryEventBus:
 
     async def publish(self, event: DomainEvent) -> None:
         """发布事件：写入 PostgreSQL + 内存缓存，广播给订阅者，并通过 Redis 跨实例广播"""
-        from app.db_legacy import save_event
+        from app.dao.event_dao import save_event
 
         ts_str = event.ts.isoformat() if hasattr(event.ts, "isoformat") else str(event.ts)
         try:
@@ -133,8 +133,8 @@ class InMemoryEventBus:
                         "error": str(e)[:300],
                     },
                 )
-            except Exception:
-                pass
+            except Exception as audit_err:
+                logger.debug("记录事件总线审计日志失败: %s", audit_err)
             fallback = self._history.get(event.meeting_id, [])
             event.seq = (fallback[-1].seq + 1) if fallback else 0
 
@@ -143,6 +143,53 @@ class InMemoryEventBus:
 
         # Redis Pub/Sub 跨实例广播
         await self._redis_publish(event)
+
+    async def publish_batch(self, events: list[DomainEvent]) -> None:
+        """批量发布事件：单次批量落库 + 逐个本地分发/Redis 广播。
+
+        用于高频可合并事件（如 tool.step），把 N 次 DB commit 合并为一次，减少磁盘同步开销。
+        落库失败时降级为逐个 publish，保证事件不丢；seq 按传入顺序单调递增
+        （event_dao 内对多行 RETURNING 的 seq 排序兜底，确保与插入顺序一致）。
+        """
+        if not events:
+            return
+        from app.dao.event_dao import save_events_batch
+
+        # 分块限制单次 multi-row INSERT 的行数，避免超参
+        chunk_size = 500
+        for i in range(0, len(events), chunk_size):
+            chunk = events[i : i + chunk_size]
+            try:
+                rows = [
+                    {
+                        "meeting_id": e.meeting_id,
+                        "type": e.type,
+                        "payload": e.payload,
+                        "ts": e.ts.isoformat() if hasattr(e.ts, "isoformat") else str(e.ts),
+                        "trace_id": e.trace_id,
+                    }
+                    for e in chunk
+                ]
+                seqs = await save_events_batch(rows)
+            except Exception as e:
+                logger.error(
+                    "批量持久化事件失败，降级逐个发布: count=%d meeting_id=%s error=%s: %s",
+                    len(chunk),
+                    chunk[0].meeting_id if chunk else "?",
+                    type(e).__name__,
+                    str(e)[:200],
+                )
+                for ev in chunk:
+                    with contextlib.suppress(Exception):
+                        await self.publish(ev)
+                continue
+
+            for ev, seq in zip(chunk, seqs, strict=True):
+                ev.seq = seq
+            for ev in chunk:
+                await self._local_dispatch(ev)
+            for ev in chunk:
+                await self._redis_publish(ev)
 
     async def _local_dispatch(self, event: DomainEvent) -> None:
         """将事件写入内存历史并通知本地订阅者。
@@ -461,7 +508,7 @@ class InMemoryEventBus:
         if events:
             return events[-1].seq
         # 内存无缓存，从 PostgreSQL 取
-        from app.db_legacy import last_event_seq
+        from app.dao.event_dao import last_event_seq
 
         return await last_event_seq(meeting_id)
 
@@ -477,7 +524,7 @@ class InMemoryEventBus:
         except RuntimeError:
             _loop = None
         if _loop is None:
-            from app.db_legacy import last_event_seq as _les
+            from app.dao.event_dao import last_event_seq as _les
 
             return _asyncio.run(_les(meeting_id))
         return 0
@@ -488,7 +535,7 @@ class InMemoryEventBus:
 
     async def _restore_from_db(self, meeting_id: str) -> list[DomainEvent]:
         """从 PostgreSQL 恢复事件到内存缓存（限制最近 _MAX_HISTORY_PER_MEETING 条）"""
-        from app.db_legacy import load_events
+        from app.dao.event_dao import load_events
 
         rows = await load_events(meeting_id, from_seq=0, limit=self._MAX_HISTORY_PER_MEETING)
         events = []

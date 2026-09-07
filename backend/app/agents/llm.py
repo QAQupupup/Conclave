@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
 from app.agents.schemas import SCHEMA_MAP
-from app.agents.trace import record_call, update_last_record
+from app.agents.trace import record_call, record_trace_event, update_last_record
 from app.config import settings
 from app.logging_config import get_logger
 
@@ -61,8 +63,15 @@ class LLMClient(Protocol):
     """LLM 客户端协议：输入 prompt，返回解析后的 dict"""
 
     async def complete(
-        self, prompt: str, schema_hint: str = "", model_override: str = "", agent_role: str = ""
+        self,
+        prompt: str,
+        schema_hint: str = "",
+        model_override: str = "",
+        agent_role: str = "",
+        on_token: Callable[[str], Any] | None = None,
     ) -> dict[str, Any]: ...
+
+    async def complete_text(self, prompt: str, temperature: float = 0.1) -> str: ...
 
 
 class StubLLM:
@@ -78,6 +87,7 @@ class StubLLM:
         schema_hint: str = "",
         model_override: str = "",
         agent_role: str = "",
+        on_token: Callable[[str], Any] | None = None,
     ) -> dict[str, Any]:
         # 根据内容判定阶段，返回对应 schema 的假数据
         if "Clarify" in prompt or schema_hint == "clarify":
@@ -475,6 +485,7 @@ class CircuitBreaker:
             if time.monotonic() - self._opened_at >= self.recovery_timeout:
                 self._state = "half_open"
                 logger.info("熔断器进入 half_open 状态，尝试恢复")
+                record_trace_event("circuit_breaker", action="half_open", failure_count=self._failure_count)
                 return True
             return False
         return True
@@ -483,6 +494,7 @@ class CircuitBreaker:
         self._failure_count = 0
         if self._state != "closed":
             logger.info("熔断器恢复到 closed 状态")
+            record_trace_event("circuit_breaker", action="recover", failure_count=0)
         self._state = "closed"
 
     def record_failure(self) -> None:
@@ -497,6 +509,12 @@ class CircuitBreaker:
                 self._failure_count,
                 self.recovery_timeout,
             )
+            record_trace_event(
+                "circuit_breaker",
+                action="trip",
+                failure_count=self._failure_count,
+                recovery_timeout_s=self.recovery_timeout,
+            )
             # 审计：熔断器跳闸
             try:
                 from app.observability.audit import audit
@@ -509,8 +527,8 @@ class CircuitBreaker:
                         "recovery_timeout_s": self.recovery_timeout,
                     },
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("记录熔断器审计日志失败: %s", e)
 
 
 # 进程级单例熔断器
@@ -566,8 +584,9 @@ class RealLLM:
     def _resolve_config(self) -> tuple[str, str, str]:
         """解析当前调用应使用的 (base_url, api_key, model)
 
-        优先级：会议级覆盖 > 租户级覆盖 > 全局默认（环境变量）
+        优先级：会议级覆盖 > 租户级覆盖 > 系统配置(DB) > 全局默认（环境变量）
         """
+        # 会议级覆盖（最高优先级）
         try:
             from app.context import get_meeting_id
             from app.llm_providers import get_meeting_llm_config
@@ -577,21 +596,37 @@ class RealLLM:
                 base_url, api_key, model, _pid = get_meeting_llm_config(mid)
                 if base_url and api_key and model:
                     return base_url, api_key, model
-        except Exception:
-            pass
-        # 租户级覆盖
+        except Exception as e:
+            logger.debug("解析会议级 LLM 配置失败，降级到下一层: %s", e)
+
+        # 系统配置层（admin 通过 UI 配置，优先于环境变量默认）
+        sys_base, sys_key, sys_model = self.base_url, self.api_key, self.model
+        try:
+            from app.services.config_service import get_cached_system_settings
+
+            sys_cfg = get_cached_system_settings()
+            if sys_cfg.get("llm_api_key"):
+                sys_key = sys_cfg["llm_api_key"]
+            if sys_cfg.get("llm_base_url"):
+                sys_base = sys_cfg["llm_base_url"]
+            if sys_cfg.get("llm_model"):
+                sys_model = sys_cfg["llm_model"]
+        except Exception as e:
+            logger.debug("读取系统配置缓存失败，使用环境变量默认: %s", e)
+
+        # 租户级覆盖（以系统配置为 base，租户设置覆盖之）
         try:
             from app.tenants.context import get_tenant_id
             from app.tenants.settings_override import resolve_llm_config
 
             tid = get_tenant_id()
             if tid is not None:
-                t_base, t_key, t_model = resolve_llm_config(tid, self.base_url, self.api_key, self.model)
+                t_base, t_key, t_model = resolve_llm_config(tid, sys_base, sys_key, sys_model)
                 if t_base and t_key and t_model:
                     return t_base, t_key, t_model
-        except Exception:
-            pass
-        return self.base_url, self.api_key, self.model
+        except Exception as e:
+            logger.debug("解析租户级 LLM 配置失败，降级到系统配置: %s", e)
+        return sys_base, sys_key, sys_model
 
     def _supports_json(self, base_url: str, model: str) -> bool:
         key = f"{base_url}|{model}"
@@ -607,12 +642,18 @@ class RealLLM:
             await self._client.aclose()
 
     async def complete(
-        self, prompt: str, schema_hint: str = "", model_override: str = "", agent_role: str = ""
+        self,
+        prompt: str,
+        schema_hint: str = "",
+        model_override: str = "",
+        agent_role: str = "",
+        on_token: Callable[[str], Any] | None = None,
     ) -> dict[str, Any]:
         """三明治模式：请求层 schema 注入 -> 解析层 Pydantic 校验 -> 重试层 -> 降级
 
         model_override: per-role 或 per-stage 模型覆盖（格式: "provider_id:model_id" 或 "model_id"）
         agent_role: 发起调用的 Agent 角色名（用于 trace/cost 记录）
+        on_token: 流式回调（仅 produce 等长等待阶段使用），非 None 时启用 SSE 流式输出
         """
         # 熔断器检查
         if not _circuit_breaker.can_call():
@@ -626,7 +667,7 @@ class RealLLM:
             return await StubLLM().complete(prompt, schema_hint)
 
         model_cls = SCHEMA_MAP.get(schema_hint)
-        schema_desc = self._schema_description(model_cls)
+        schema_desc = self._schema_description(model_cls, schema_hint)
         # schema_hint 即阶段名，用于 trace 记录
         stage = schema_hint
         temp = STAGE_TEMPERATURES().get(stage, 0.0)
@@ -647,7 +688,8 @@ class RealLLM:
             )
             prompt = trim_prompt_to_budget(prompt, max_tokens=settings.llm_max_prompt_tokens)
 
-        # [FALLBACK] Provider 回退链：连接失败时尝试下一个 provider
+        # [FALLBACK] Provider 回退链：连接失败/余额不足时尝试下一个 provider
+        from app.core.exceptions import InsufficientBalanceError
         from app.llm_providers import get_fallback_chain
 
         fallback_chain = get_fallback_chain(model_override=model_override or None)
@@ -662,7 +704,9 @@ class RealLLM:
 
             for attempt in range(1, self.MAX_ATTEMPTS + 1):
                 try:
-                    content = await self._call_api(
+                    # 流式回调仅在首次尝试使用，重试不重复流式
+                    _stream_cb = on_token if attempt == 1 else None
+                    content, native_reasoning = await self._call_api(
                         current_prompt,
                         schema_desc,
                         stage,
@@ -670,17 +714,35 @@ class RealLLM:
                         config_override=(_p_url, _p_key, _p_model),
                         agent_role=agent_role,
                         provider_id=_p_id,
+                        on_token=_stream_cb,
                     )
                     # [FALLBACK] 最小输出长度校验：防止 LLM 返回空内容导致管线空转
-                    # cross_team / produce / arbitrate 需要生成结构化内容（冲突列表、PRD、裁决），
-                    # 50 字符远远不够；其他阶段（clarify, intra_team 等）保持较低阈值
-                    _min_len = 200 if stage in ("cross_team", "produce", "arbitrate") else 50
+                    # 按阶段分级：meta 输出短阶段名（~15 chars），produce 需要完整 PRD
+                    if stage in ("meta", "meta_next_stage"):
+                        _min_len = 10
+                    elif stage in ("clarify", "intra_team"):
+                        _min_len = 30
+                    elif stage in ("cross_team", "arbitrate"):
+                        _min_len = 100
+                    elif stage == "produce":
+                        _min_len = 200
+                    else:
+                        _min_len = 50
                     if len(content.strip()) < _min_len:
                         raise ValueError(
                             f"LLM 返回内容过短 ({len(content.strip())} chars < {_min_len})，"
                             f"阶段={stage} 模型={_p_model} 输出质量不足"
                         )
-                    parsed = self._extract_json(content)
+                    parsed, reasoning = _extract_json_with_reasoning(content)
+                    # 合并推理文本：标记前文本优先，其次原生 reasoning_content
+                    full_reasoning = reasoning or native_reasoning
+                    if full_reasoning:
+                        logger.info(
+                            "阶段=%s 模型推理过程 (%d chars): %s...",
+                            stage,
+                            len(full_reasoning),
+                            full_reasoning[:300],
+                        )
                     if model_cls is not None:
                         validated: BaseModel = model_cls.model_validate(parsed)
                         result = validated.model_dump()
@@ -689,6 +751,7 @@ class RealLLM:
                     update_last_record(
                         parsed_result=result if isinstance(result, dict) else None,
                         validation_status="valid",
+                        reasoning=full_reasoning[:2000] if full_reasoning else None,
                     )
                     logger.info(
                         "阶段=%s attempt=%d provider=%s 解析成功 (temp=%.1f)",
@@ -708,6 +771,39 @@ class RealLLM:
                         claims_val = result.get("claims")
                         if not claims_val:
                             raise ValueError("intra_team 阶段 claims 为空，LLM 未输出有效论点")
+                        # claim 类型同质化检测：全部为同一类型（尤其 assumption）时记录警告
+                        claim_types = {c.get("type", "assumption") for c in claims_val if isinstance(c, dict)}
+                        if len(claim_types) == 1:
+                            _homog_type = claim_types.pop() if claim_types else "unknown"
+                            result["_claim_type_homogeneous"] = True
+                            logger.warning(
+                                "intra_team claim 类型同质化: 全部为 '%s'（共 %d 条），"
+                                "LLM 未区分 fact/assumption/constraint",
+                                _homog_type,
+                                len(claims_val),
+                            )
+                            from app.observability.log_bus import log_bus
+
+                            log_bus.warning(
+                                f"intra_team claim 类型同质化: 全部为 '{_homog_type}'",
+                                logger="agents.llm",
+                                extra={
+                                    "stage": "intra_team",
+                                    "claim_type_homogeneous": True,
+                                    "homogeneous_type": _homog_type,
+                                    "claim_count": len(claims_val),
+                                },
+                            )
+                    # cross_team 阶段：空冲突 + pass 门禁 = 矛盾，触发重试
+                    if schema_hint == "cross_team" and isinstance(result, dict):
+                        conflicts_val = result.get("conflicts")
+                        gate_val = result.get("gate") or {}
+                        gate_dec = gate_val.get("decision", "pass") if isinstance(gate_val, dict) else "pass"
+                        if not conflicts_val and gate_dec == "pass":
+                            raise ValueError(
+                                "cross_team 阶段 conflicts 为空但门禁判定 pass，"
+                                "矛盾输出——冲突识别是 cross_team 的核心任务"
+                            )
                     # produce 阶段：校验代码类产出的关键字段非空
                     if schema_hint.startswith("produce") and isinstance(result, dict):
                         _ds = result.get("deployable_service")
@@ -737,18 +833,98 @@ class RealLLM:
                         logger="agents.llm",
                         extra={"stage": stage, "provider": _p_id, "error": last_error[:300]},
                     )
+                    # 记录 provider 切换事件到 trace
+                    next_provider_id = (
+                        fallback_chain[provider_idx + 1][3] if provider_idx + 1 < len(fallback_chain) else "stub"
+                    )
+                    record_trace_event(
+                        "provider_switch",
+                        stage=stage,
+                        from_provider=_p_id,
+                        to_provider=next_provider_id,
+                        reason=type(conn_err).__name__,
+                        error=str(conn_err)[:300],
+                    )
                     break  # 跳出重试循环，尝试下一个 provider
-                except (ValidationError, json.JSONDecodeError, KeyError, httpx.HTTPError) as e:
+                except InsufficientBalanceError as bal_err:
+                    # 余额不足：切换到下一个 provider
+                    # 而非穿透到 compute.think() 导致整个阶段直接失败
+                    last_error = f"{_p_id}: {type(bal_err).__name__}: {bal_err}"
+                    logger.warning(
+                        "阶段=%s provider=%s 余额不足, 尝试下一个 provider: %s",
+                        stage,
+                        _p_id,
+                        last_error[:200],
+                    )
+                    from app.observability.log_bus import log_bus
+
+                    log_bus.warning(
+                        f"Provider {_p_id} 余额不足, 尝试回退",
+                        logger="agents.llm",
+                        extra={"stage": stage, "provider": _p_id, "error": last_error[:300]},
+                    )
+                    next_provider_id = (
+                        fallback_chain[provider_idx + 1][3] if provider_idx + 1 < len(fallback_chain) else "stub"
+                    )
+                    record_trace_event(
+                        "provider_switch",
+                        stage=stage,
+                        from_provider=_p_id,
+                        to_provider=next_provider_id,
+                        reason="InsufficientBalanceError",
+                        error=str(bal_err)[:300],
+                    )
+                    break  # 跳出重试循环，尝试下一个 provider
+                except (ValidationError, json.JSONDecodeError, KeyError, httpx.HTTPError, ValueError) as e:
+                    # Tier 3 回退：JSON 解析失败时尝试强制 JSON 模式重试
+                    if isinstance(e, json.JSONDecodeError) and self._supports_json(_p_url, _p_model):
+                        logger.warning("阶段=%s 三层提取失败，尝试 Tier 3 (JSON Mode 强制重试)", stage)
+                        try:
+                            content_t3, _ = await self._call_api(
+                                current_prompt + "\n\n请注意：必须只输出合法 JSON，不要包含任何其他文本。",
+                                schema_desc,
+                                stage,
+                                attempt,
+                                config_override=(_p_url, _p_key, _p_model),
+                                agent_role=agent_role,
+                                provider_id=_p_id,
+                                force_json_mode=True,
+                            )
+                            parsed_t3 = json.loads(_strip_code_fences(content_t3))
+                            if model_cls is not None:
+                                validated_t3: BaseModel = model_cls.model_validate(parsed_t3)
+                                result_t3 = validated_t3.model_dump()
+                            else:
+                                result_t3 = parsed_t3 if isinstance(parsed_t3, dict) else {"result": parsed_t3}
+                            logger.info("阶段=%s Tier 3 JSON Mode 重试成功", stage)
+                            update_last_record(
+                                parsed_result=result_t3 if isinstance(result_t3, dict) else None,
+                                validation_status="valid",
+                            )
+                            _circuit_breaker.record_success()
+                            return result_t3  # type: ignore[no-any-return]
+                        except Exception:
+                            pass  # Tier 3 也失败，继续正常错误处理
+
                     error_detail = ""
                     if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
                         error_detail = f" [HTTP {e.response.status_code}: {e.response.text[:200]}]"
                     last_error = f"{_p_id}: {type(e).__name__}: {e}{error_detail}"
                     logger.warning("阶段=%s provider=%s attempt=%d 失败: %s", stage, _p_id, attempt, last_error[:200])
                     update_last_record(validation_status="invalid", error_detail=last_error)
+                    # 短内容错误时增强提示，要求详细输出
+                    short_content_hint = ""
+                    if "内容过短" in str(e) or "too short" in str(e).lower():
+                        short_content_hint = (
+                            "\n特别注意：上一次输出内容过短。"
+                            "请提供完整的结构化 JSON 输出，包含所有必需字段的详细内容，"
+                            "不要只输出简短的字段值。"
+                        )
                     current_prompt = (
                         f"{prompt}\n\n"
                         f"【上一次输出校验失败（第 {attempt} 次），错误：{last_error}】\n"
                         f"请严格按给定 JSON Schema 重新输出，仅输出合法 JSON，不要包含注释或围栏。"
+                        f"{short_content_hint}"
                     )
 
             provider_idx += 1
@@ -769,6 +945,20 @@ class RealLLM:
                 "action": "fallback_stub",
             },
         )
+        # 记录 stub 降级事件和熔断器状态到 trace
+        record_trace_event(
+            "stub_fallback",
+            stage=stage,
+            reason="all_providers_failed",
+            last_error=last_error[:500],
+        )
+        record_trace_event(
+            "circuit_breaker",
+            stage=stage,
+            action="record_failure",
+            failure_count=_circuit_breaker._failure_count,
+            state=_circuit_breaker.state,
+        )
         # 记录降级到 trace
         _fb_base, _fb_key, _fb_model = self._resolve_config()
         record_call(
@@ -782,6 +972,8 @@ class RealLLM:
             validation_status="fallback_stub",
             attempt=self.MAX_ATTEMPTS,
             latency_ms=0,
+            http_request_body=None,
+            http_response_text="",
         )
         stub = StubLLM()
         return await stub.complete(prompt, schema_hint=schema_hint)
@@ -796,7 +988,7 @@ class RealLLM:
             logger.warning("熔断器打开，跳过摘要 LLM 调用")
             return ""
         try:
-            content = await self._call_api(
+            content, _ = await self._call_api(
                 prompt,
                 schema_desc="",
                 stage="summarize",
@@ -814,12 +1006,96 @@ class RealLLM:
     # ---------- 请求层 ----------
 
     @staticmethod
-    def _schema_description(model_cls: type[BaseModel] | None) -> str:
-        """把 Pydantic 模型转成 JSON Schema 文本，注入 system message"""
+    def _schema_description(
+        model_cls: type[BaseModel] | None,
+        schema_hint: str = "",
+    ) -> str:
+        """把 Pydantic 模型转成 JSON Schema 文本，注入 system message
+
+        对特定阶段追加字段语义说明，帮助 LLM 理解枚举值的区分标准
+        （JSON Schema 本身只有 ``"type": "string"``，无语义信息）。
+        """
         if model_cls is None:
             return ""
         schema = model_cls.model_json_schema()
-        return json.dumps(schema, ensure_ascii=False, indent=2)
+        desc = json.dumps(schema, ensure_ascii=False, indent=2)
+
+        # intra_team: claim.type 字段需要语义指导，防止 LLM 全部默认 "assumption"
+        if schema_hint == "intra_team":
+            desc += "\n\n字段说明：\n"
+            desc += "- type: 必须根据证据来源选择——"
+            desc += '有文档证据用 "fact"，纯推理用 "assumption"，'
+            desc += '技术/业务限制用 "constraint"。不要全部使用同一种类型。'
+
+        return desc
+
+    async def _call_api_stream(
+        self,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        stage_timeout: float,
+        on_token: Callable[[str], Any],
+    ) -> tuple[str, str, int, int, int, int]:
+        """SSE 流式调用 LLM，返回 (content, reasoning, input_tok, output_tok, total_tok, latency_ms)
+
+        解析 SSE ``data: {...}`` 行，累积 content 和 reasoning_content，
+        每个 delta.content 片段通过 on_token 回调传递给调用方。
+        on_token 可以是同步或异步 callable，返回协程时自动 await。
+        usage 信息从最后一个 chunk 提取（部分 provider 不返回 usage，此时为 0）。
+        """
+        import asyncio
+        import time
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        input_tokens = 0
+        output_tokens = 0
+        total_tokens = 0
+        t0 = time.monotonic()
+
+        async with self._client.stream("POST", url, headers=headers, json=body, timeout=stage_timeout) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]  # strip "data: " prefix
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    delta_content = delta.get("content", "")
+                    if delta_content:
+                        content_parts.append(delta_content)
+                        try:
+                            _cb_result = on_token(delta_content)
+                            if asyncio.iscoroutine(_cb_result):
+                                await _cb_result
+                        except Exception:
+                            pass  # 回调异常不影响 LLM 调用
+                    delta_reasoning = delta.get("reasoning_content", "")
+                    if delta_reasoning:
+                        reasoning_parts.append(delta_reasoning)
+                # usage 通常在最后一个 chunk
+                chunk_usage = chunk.get("usage")
+                if isinstance(chunk_usage, dict):
+                    input_tokens = chunk_usage.get("prompt_tokens", 0) or input_tokens
+                    output_tokens = chunk_usage.get("completion_tokens", 0) or output_tokens
+                    total_tokens = chunk_usage.get("total_tokens", 0) or total_tokens
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        content = "".join(content_parts)
+        native_reasoning = "".join(reasoning_parts)
+        # 部分 provider 流式不返回 usage，用 content 长度粗估 output_tokens
+        if total_tokens == 0 and content:
+            output_tokens = max(1, len(content) // 4)
+            total_tokens = input_tokens + output_tokens
+        return content, native_reasoning, input_tokens, output_tokens, total_tokens, latency_ms
 
     async def _call_api(
         self,
@@ -831,19 +1107,27 @@ class RealLLM:
         agent_role: str = "",
         provider_id: str = "",
         system_message_override: str = "",
-    ) -> str:
-        """调用 chat completions，返回 message content 字符串
+        force_json_mode: bool = False,
+        on_token: Callable[[str], None] | None = None,
+    ) -> tuple[str, str]:
+        """调用 chat completions，返回 (content, native_reasoning) 元组
 
         第1层确定性约束：
         - temperature 按阶段查 STAGE_TEMPERATURES（关键阶段=0，讨论阶段=0.3）
         - top_p 固定 1.0
         - seed 固定 42（API 支持则同一输入必同一输出）
-        - system message 末尾加 /no_think（关闭 Qwen3.5 思考模式）
 
         支持会议级模型覆盖：每次调用解析 _resolve_config() 获取当前生效的
         base_url / api_key / model，支持会议运行中切换模型和BYOK。
 
         config_override: 外部指定的 (base_url, api_key, model)，用于 provider 回退链。
+        force_json_mode: True 时强制使用 JSON Mode（Tier 3 回退），传 response_format
+                         并使用限制性 system message。
+        on_token: 流式回调，非 None 时启用 SSE 流式输出，每收到一个 delta 调用一次。
+                  仅用于 produce 等长等待阶段提供增量反馈，不影响 JSON 解析逻辑。
+
+        Returns:
+            (content, native_reasoning) — native_reasoning 为 DeepSeek/Qwen 原生推理
         """
         import time
 
@@ -861,14 +1145,30 @@ class RealLLM:
         if system_message_override:
             # M1.1: 纯文本模式（摘要生成等），不强制 JSON，不加 /no_think（允许模型思考）
             system_content = system_message_override
-        else:
+        elif force_json_mode:
+            # Tier 3 回退：强制 JSON 模式，使用限制性 system message
             system_content = "你是会议决策助手，严格输出 JSON，不要输出多余文本。"
             if schema_desc:
                 system_content += (
                     f"\n输出必须严格符合以下 JSON Schema（多余字段会被忽略，缺字段尽量补全默认值）：\n{schema_desc}"
                 )
-            # 关闭 Qwen3.5 思考模式，防止思考过程干扰 JSON 输出
-            if settings.llm_no_think:
+        else:
+            # 默认模式：鼓励模型自由思考，用标记分隔 JSON
+            system_content = (
+                "你是会议决策助手。请先深入思考和分析问题，展开推理过程。\n"
+                "思考完成后，输出 <<<JSON_RESULT>>> 标记，"
+                "然后在标记后面输出符合 Schema 的 JSON 结果。\n"
+                "思考过程和 JSON 结果之间用 <<<JSON_RESULT>>> 分隔。\n"
+                '在 JSON 中可包含可选字段 "_ck"，用一句话总结你的最终结论。\n'
+                "不要用 ```json``` 围栏包裹 JSON。"
+            )
+            if schema_desc:
+                system_content += (
+                    f"\n输出 JSON 必须符合以下 Schema（多余字段会被忽略，缺字段尽量补全默认值）：\n{schema_desc}"
+                )
+            # /no_think 是 Qwen3.5 专有指令，仅对 Qwen 模型附加
+            # DeepSeek 不需要此指令，附加可能干扰输出
+            if settings.llm_no_think and "qwen" in model.lower():
                 system_content += "\n/no_think"
         # 分阶段温度：按 stage 查表，默认 0（最严格）
         temp = STAGE_TEMPERATURES().get(stage, 0.0)
@@ -883,15 +1183,79 @@ class RealLLM:
             "top_p": 1.0,
             "seed": 42,
         }
-        # 请求层：纯文本模式不传 response_format；JSON 模式按 base_url+model 缓存支持情况
-        if not system_message_override and self._supports_json(base_url, model):
+        # 请求层：默认不传 response_format，允许模型自由思考
+        # 仅 force_json_mode=True（Tier 3 回退）时传 response_format
+        if force_json_mode and not system_message_override and self._supports_json(base_url, model):
             body["response_format"] = {"type": "json_object"}
 
-        latency_ms = 0
         # produce 阶段生成大量文本（OpenAPI），需要更长超时
         # DeepSeek-V3.2 生成 PRD+OpenAPI 可能需要 200-400s
         # produce_* 子类型同样需要长超时
         stage_timeout = settings.llm_produce_timeout if stage.startswith("produce") else settings.llm_default_timeout
+
+        # --- 流式路径（on_token 非空时启用，失败自动回退到非流式）---
+        if on_token is not None:
+            body["stream"] = True
+            try:
+                (
+                    content,
+                    native_reasoning,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    latency_ms,
+                ) = await self._call_api_stream(url, headers, body, stage_timeout, on_token)
+                # 捕获 Qwen 的 <RichMediaReference> 思考内容（与非流式路径一致）
+                if not native_reasoning and "<RichMediaReference>" in content:
+                    think_end = content.find("<RichMediaReference>")
+                    if think_end != -1:
+                        native_reasoning = content[:think_end].strip()
+                if native_reasoning:
+                    logger.debug(
+                        "阶段=%s 模型原生推理 (%d chars): %s...",
+                        stage,
+                        len(native_reasoning),
+                        native_reasoning[:200],
+                    )
+                record_call(
+                    stage=stage,
+                    model=model,
+                    temperature=temp,
+                    seed=settings.llm_seed,
+                    prompt=user_prompt,
+                    raw_response=content,
+                    parsed_result=None,
+                    validation_status="valid",
+                    attempt=attempt,
+                    latency_ms=latency_ms,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=total_tokens,
+                    agent_role=agent_role,
+                    provider_id=provider_id,
+                    http_request_body=body,
+                    http_response_text=content,
+                )
+                try:
+                    from app.observability.cost_tracker import get_cost_tracker
+
+                    await get_cost_tracker().record_llm(
+                        node=stage,
+                        model=model,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        latency_ms=latency_ms,
+                    )
+                except Exception as e:
+                    logger.debug("记录 LLM 调用成本失败: %s", e)
+                return content, native_reasoning
+            except Exception as stream_err:
+                logger.warning("流式调用失败，回退到非流式: %s", stream_err)
+                body.pop("stream", None)
+                # 继续走非流式路径
+
+        # --- 非流式路径（原逻辑）---
+        latency_ms = 0
         t0 = time.monotonic()
         try:
             resp = await self._client.post(url, headers=headers, json=body, timeout=stage_timeout)
@@ -903,6 +1267,39 @@ class RealLLM:
             latency_ms = int((time.monotonic() - t0) * 1000)
         except httpx.HTTPStatusError as e:
             latency_ms = int((time.monotonic() - t0) * 1000)
+            # 余额不足检测：402 Payment Required / 特定 403 / 429 insufficient_quota
+            # 抛出 InsufficientBalanceError，Runner 捕获后暂停会议（PAUSED）而非 FAILED
+            if self._is_insufficient_balance(e):
+                record_call(
+                    stage=stage,
+                    model=model,
+                    temperature=temp,
+                    seed=settings.llm_seed,
+                    prompt=user_prompt,
+                    raw_response=f"HTTP {e.response.status_code}: {e.response.text[:500]}",
+                    validation_status="invalid",
+                    attempt=attempt,
+                    latency_ms=latency_ms,
+                    input_tokens=0,
+                    output_tokens=0,
+                    total_tokens=0,
+                    agent_role=agent_role,
+                    provider_id=provider_id,
+                    error_detail=f"InsufficientBalance: HTTP {e.response.status_code} {e.response.text[:300]}",
+                    http_request_body=body,
+                    http_response_text=e.response.text[:2000],
+                )
+                from app.core.exceptions import InsufficientBalanceError
+
+                raise InsufficientBalanceError(
+                    f"API 余额不足: HTTP {e.response.status_code}",
+                    details={
+                        "status_code": e.response.status_code,
+                        "provider_id": provider_id,
+                        "model": model,
+                        "response_snippet": e.response.text[:500],
+                    },
+                ) from e
             # 接口可能不支持 response_format（返回 400），自动降级去掉该参数重试一次
             if (
                 self._supports_json(base_url, model)
@@ -935,6 +1332,8 @@ class RealLLM:
                         agent_role=agent_role,
                         provider_id=provider_id,
                         error_detail=f"HTTPStatusError after json_mode fallback: {e2.response.status_code} {e2.response.text[:300]}",
+                        http_request_body=body,
+                        http_response_text=e2.response.text[:2000],
                     )
                     raise
             else:
@@ -955,6 +1354,8 @@ class RealLLM:
                     agent_role=agent_role,
                     provider_id=provider_id,
                     error_detail=f"HTTPStatusError: {e.response.status_code} {e.response.text[:300]}",
+                    http_request_body=body,
+                    http_response_text=e.response.text[:2000],
                 )
                 raise
         except (
@@ -985,11 +1386,28 @@ class RealLLM:
                 agent_role=agent_role,
                 provider_id=provider_id,
                 error_detail=f"{type(e).__name__}: {str(e)[:300]}",
+                http_request_body=body,
             )
             raise
 
         data = resp.json()
-        content = data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
+        content = message.get("content", "")
+        # 捕获原生推理字段（DeepSeek 的 reasoning_content）
+        native_reasoning = message.get("reasoning_content", "")
+        # 捕获 Qwen 的 <RichMediaReference> 思考内容（不修改 content，让提取管线处理）
+        if not native_reasoning and "<RichMediaReference>" in content:
+            think_end = content.find("<RichMediaReference>")
+            if think_end != -1:
+                native_reasoning = content[:think_end].strip()
+        # 记录原生推理到日志（调试关键信息）
+        if native_reasoning:
+            logger.debug(
+                "阶段=%s 模型原生推理 (%d chars): %s...",
+                stage,
+                len(native_reasoning),
+                native_reasoning[:200],
+            )
         # 解析 token 用量
         usage = data.get("usage", {})
         input_tokens = usage.get("prompt_tokens", 0)
@@ -1012,6 +1430,8 @@ class RealLLM:
             total_tokens=total_tokens,
             agent_role=agent_role,
             provider_id=provider_id,
+            http_request_body=body,
+            http_response_text=resp.text,
         )
         # 成本可观测性：记录 LLM 调用成本到 CostTracker
         # （estimate_llm_cost 内部会优先查 llm_providers 的多厂商定价表）
@@ -1025,37 +1445,195 @@ class RealLLM:
                 output_tokens=output_tokens,
                 latency_ms=latency_ms,
             )
-        except Exception:
-            pass
-        return content  # type: ignore[no-any-return]
+        except Exception as e:
+            logger.debug("记录 LLM 调用成本失败: %s", e)
+        return content, native_reasoning
 
     @staticmethod
     def _looks_like_json_mode_error(e: httpx.HTTPStatusError) -> bool:
         """粗判 400 是否由 response_format 引起"""
         try:
             text = e.response.text.lower()
-        except Exception:
+        except Exception as exc:
+            logger.debug("读取 HTTP 错误响应文本失败: %s", exc)
             return False
         return any(kw in text for kw in ("response_format", "json_object", "json_schema", "not support"))
 
     @staticmethod
+    def _is_insufficient_balance(e: httpx.HTTPStatusError) -> bool:
+        """检测 HTTP 错误是否由 API 余额不足引起。
+
+        覆盖主流 LLM 提供商的余额不足错误模式：
+        - HTTP 402 Payment Required（DeepSeek、OpenRouter）
+        - HTTP 403 + 响应体含 balance/quota/payment 关键词（SiliconFlow）
+        - HTTP 429 + error.type == "insufficient_quota"（OpenAI）
+        - HTTP 429 + code == "SetLimitExceeded"/"QuotaExceeded"（火山方舟 Ark 安心体验模式）
+        """
+        status = e.response.status_code
+        if status == 402:
+            return True
+        try:
+            text = e.response.text.lower()
+        except Exception:
+            return False
+        if status == 403:
+            return any(kw in text for kw in ("balance", "insufficient", "quota", "payment required", "余额不足"))
+        if status == 429:
+            # OpenAI 风格: {"error": {"type": "insufficient_quota", ...}}
+            # 火山方舟风格: {"error": {"code": "SetLimitExceeded", ...}} 或 {"error": {"code": "QuotaExceeded", ...}}
+            return any(
+                kw in text
+                for kw in (
+                    "insufficient_quota",
+                    "setlimitexceeded",
+                    "quotaexceeded",
+                    "free trial quota",
+                    "inference limit",
+                    "额度",
+                )
+            ) or ("quota" in text and "balance" in text)
+        return False
+
+    @staticmethod
     def _extract_json(content: str) -> Any:
-        """容错提取 JSON：去掉 ```json 围栏与多余文本"""
-        content = (content or "").strip()
-        if content.startswith("```"):
-            # 去掉首行围栏（```json 或 ```）
-            parts = content.split("\n", 1)
-            if len(parts) >= 2:
-                content = parts[1]
-                # 去掉闭合围栏（如果存在）
-                closing = content.rsplit("```", 1)
-                if len(closing) >= 2:
-                    content = closing[0]
-        return json.loads(content)
+        """容错提取 JSON（兼容旧调用，内部委托给三层管线）"""
+        parsed, _ = _extract_json_with_reasoning(content)
+        return parsed
+
+
+# ── 三层 JSON 提取管线 ─────────────────────────────────────
+# Tier 1: 标记分隔提取（主方案）— 模型自由思考后用标记分隔 JSON
+# Tier 2: 启发式 JSON 块提取（回退 1）— 花括号匹配找最大合法 JSON
+# Tier 3: 围栏清理后直接解析（回退 2）— 兼容旧的 ```json``` 围栏
+
+_JSON_MARKERS: list[str] = [
+    "<<<JSON_RESULT>>>",
+    "这是最终思考后的Json答复",
+    "以下是最终的JSON答复",
+    "Final JSON:",
+    "最终JSON答复：",
+]
+
+
+def _strip_code_fences(content: str) -> str:
+    """去掉 ```json ... ``` 围栏"""
+    content = content.strip()
+    if content.startswith("```"):
+        parts = content.split("\n", 1)
+        if len(parts) >= 2:
+            content = parts[1]
+            closing = content.rsplit("```", 1)
+            if len(closing) >= 2:
+                content = closing[0]
+    return content.strip()
+
+
+def _try_parse_json(text: str) -> Any | None:
+    """尝试解析 JSON，失败则尝试提取花括号块，返回 None 表示失败"""
+    text = _strip_code_fences(text.strip())
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+def _extract_largest_json_block(text: str) -> Any | None:
+    """从文本中提取最大的合法 JSON 块（花括号深度匹配，字符串感知）"""
+    for start in range(len(text)):
+        if text[start] != "{":
+            continue
+        depth = 0
+        in_string = False
+        escape = False
+        for end in range(start, len(text)):
+            ch = text[end]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : end + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break  # 此起始位置无效，试下一个
+    return None
+
+
+def _extract_json_with_reasoning(content: str) -> tuple[Any, str]:
+    """三层回退提取 JSON，返回 (parsed_json, reasoning_text)
+
+    Tier 1: 标记分隔提取（主方案）— 搜索 _JSON_MARKERS 中的标记
+    Tier 2: 启发式 JSON 块提取（花括号匹配）
+    Tier 3: 围栏清理后直接解析（兼容旧行为）
+
+    Returns:
+        (parsed_json, reasoning_text) — reasoning_text 为标记前的思考过程
+    Raises:
+        json.JSONDecodeError — 三层全部失败时抛出
+    """
+    content = (content or "").strip()
+    if not content:
+        raise json.JSONDecodeError("空内容", "", 0)
+
+    # Tier 1: 标记分隔提取
+    for marker in _JSON_MARKERS:
+        if marker in content:
+            parts = content.split(marker, 1)
+            reasoning = parts[0].strip()
+            json_str = parts[1].strip() if len(parts) > 1 else ""
+            if json_str:
+                parsed = _try_parse_json(json_str)
+                if parsed is not None:
+                    return parsed, reasoning
+
+    # Tier 2: 启发式 JSON 块提取
+    parsed = _extract_largest_json_block(content)
+    if parsed is not None:
+        # 如果整个内容就是纯 JSON（无额外文字），reasoning 为空
+        stripped = content.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                json.loads(stripped)
+                return parsed, ""
+            except json.JSONDecodeError:
+                pass
+        return parsed, content
+
+    # Tier 3: 围栏清理后直接解析
+    cleaned = _strip_code_fences(content)
+    parsed = json.loads(cleaned)  # 失败时抛出 JSONDecodeError
+    return parsed, ""
+
+
+_stub_llm_warned = False
 
 
 def get_llm() -> LLMClient:
     """按配置返回 LLM 客户端：有 key 用真实，否则用 stub"""
+    global _stub_llm_warned
     if settings.use_real_llm:
         return RealLLM()
+    if not _stub_llm_warned:
+        logger.warning(
+            "⚠️ LLM 未配置 API Key，使用 StubLLM 返回模拟数据。配置 LLM_API_KEY 或 LLM_PROVIDER 环境变量以使用真实 LLM。"
+        )
+        _stub_llm_warned = True
     return StubLLM()

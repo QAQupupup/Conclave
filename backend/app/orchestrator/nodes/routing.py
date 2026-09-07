@@ -16,21 +16,21 @@ def _resolve_model_for_routing(state: MeetingState) -> str:
 # 防止无限循环和无效跳转
 _VALID_NEXT_STAGES: dict[Stage, set[Stage]] = {
     Stage.CLARIFY: {Stage.INTRA_TEAM, Stage.PRODUCE},
-    Stage.INTRA_TEAM: {Stage.INTRA_TEAM, Stage.CROSS_TEAM, Stage.EVIDENCE_CHECK, Stage.ARBITRATE, Stage.PRODUCE},
+    # INTRA_TEAM 后可到 CROSS_TEAM（standard/deep）、ARBITRATE（light 快速仲裁）、PRODUCE。
+    # 不允许直接到 EVIDENCE_CHECK（证据校验依赖冲突，而冲突在 CROSS_TEAM 中识别）。
+    # standard/deep 深度下 mandatory_stages 会收窄到 {CROSS_TEAM}，防止跳过跨队辩论。
+    Stage.INTRA_TEAM: {Stage.INTRA_TEAM, Stage.CROSS_TEAM, Stage.ARBITRATE, Stage.PRODUCE},
     Stage.CROSS_TEAM: {
-        Stage.INTRA_TEAM,
-        Stage.CROSS_TEAM,
+        Stage.INTRA_TEAM,  # 门禁 supplement 回流
+        Stage.CROSS_TEAM,  # 门禁 re_examine 重审
         Stage.EVIDENCE_CHECK,
-        Stage.ARBITRATE,
+        Stage.ARBITRATE,  # 无冲突时直接仲裁（由代码层判断）
         Stage.PRODUCE,
-    },  # +回退INTRA_TEAM
-    Stage.EVIDENCE_CHECK: {Stage.CROSS_TEAM, Stage.EVIDENCE_CHECK, Stage.ARBITRATE, Stage.PRODUCE},  # +回退CROSS_TEAM
-    Stage.ARBITRATE: {
-        Stage.EVIDENCE_CHECK,
-        Stage.CROSS_TEAM,
-        Stage.ARBITRATE,
-        Stage.PRODUCE,
-    },  # +回退EVIDENCE_CHECK/CROSS_TEAM
+    },
+    # EVIDENCE_CHECK 后可回退到 CROSS_TEAM（证据不足重新辩论）或前进到 ARBITRATE
+    Stage.EVIDENCE_CHECK: {Stage.CROSS_TEAM, Stage.EVIDENCE_CHECK, Stage.ARBITRATE, Stage.PRODUCE},
+    # ARBITRATE 后可回退到 EVIDENCE_CHECK（补充证据）或 CROSS_TEAM（重新辩论）或前进到 PRODUCE
+    Stage.ARBITRATE: {Stage.EVIDENCE_CHECK, Stage.CROSS_TEAM, Stage.ARBITRATE, Stage.PRODUCE},
     Stage.PRODUCE: set(),  # 终态
 }
 
@@ -63,11 +63,19 @@ def _inc_loop_count(state: MeetingState, stage: Stage) -> None:
 
 
 def _build_state_summary(state: MeetingState) -> str:
-    """构建当前状态摘要，供元认知 Agent 决策"""
+    """构建当前状态摘要，供元认知 Agent 决策
+
+    [Wave 6] 议题文本经过 sanitize_untrusted_content 清洗，
+    防止用户通过 topic 注入指令劫持元认知路由决策。
+    """
+    from app.orchestrator.prompt_safety import sanitize_untrusted_content
+
+    raw_topic = state.clarified_topic or state.topic
+    safe_topic = sanitize_untrusted_content(raw_topic)
     parts = [
         f"当前阶段: {state.stage.value}",
         f"辩论深度: {state.debate_depth}",
-        f"议题: {state.clarified_topic or state.topic}",
+        f"议题: {safe_topic}",
     ]
     if state.key_questions:
         parts.append(f"关键问题: {', '.join(state.key_questions[:3])}")
@@ -116,9 +124,9 @@ async def decide_next_stage(state: MeetingState) -> Stage:
     max_loops = _MAX_LOOP_COUNT.get(current, 1)
     loop_count = _get_loop_count(state, current)
     if loop_count >= max_loops:
-        from conclave_core.state import next_stage as _ns
+        from ..workflow_templates import next_stage_with_template
 
-        forced_next = _ns(current, state.flow_plan)
+        forced_next = next_stage_with_template(current, state.workflow_template, state.flow_plan)
         if forced_next and forced_next in valid_next:
             # 推进到管线中的下一个阶段（非PRODUCE），给后续阶段发言机会
             return forced_next
@@ -137,9 +145,11 @@ async def decide_next_stage(state: MeetingState) -> Stage:
             if s.value not in visited_stages:
                 mandatory_stages.add(s)
     elif state.debate_depth == "standard":
-        # 标准辩论：intra_team 必须执行；有冲突时 evidence_check 也必须执行
+        # 标准辩论：intra_team 和 cross_team 必须执行；有冲突时 evidence_check 也必须执行
         if Stage.INTRA_TEAM.value not in visited_stages:
             mandatory_stages.add(Stage.INTRA_TEAM)
+        if Stage.INTRA_TEAM.value in visited_stages and Stage.CROSS_TEAM.value not in visited_stages:
+            mandatory_stages.add(Stage.CROSS_TEAM)
         if state.conflicts and Stage.EVIDENCE_CHECK.value not in visited_stages:
             mandatory_stages.add(Stage.EVIDENCE_CHECK)
     elif state.debate_depth == "light":
@@ -222,9 +232,9 @@ async def decide_next_stage(state: MeetingState) -> Stage:
                 return stage
 
         # 回退：按固定顺序前进
-        from conclave_core.state import next_stage as _ns
+        from ..workflow_templates import next_stage_with_template
 
-        fallback = _ns(current, state.flow_plan)
+        fallback = next_stage_with_template(current, state.workflow_template, state.flow_plan)
         if fallback and fallback in valid_next:
             return fallback
 
@@ -232,6 +242,6 @@ async def decide_next_stage(state: MeetingState) -> Stage:
         pass
 
     # 最终回退
-    from conclave_core.state import next_stage as _ns
+    from ..workflow_templates import next_stage_with_template
 
-    return _ns(current, state.flow_plan) or Stage.PRODUCE
+    return next_stage_with_template(current, state.workflow_template, state.flow_plan) or Stage.PRODUCE

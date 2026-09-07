@@ -12,9 +12,13 @@
 # - ReactLoop：LLM 自主决定"下一步调用什么工具"，工具执行后 LLM 观察结果再决策
 from __future__ import annotations
 
+import asyncio
+import base64
+import contextlib
 import os
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from app.agents.compute import (
@@ -85,11 +89,15 @@ class ToolRegistry:
             )
         try:
             result = await tool["fn"](arguments)
+            # [Wave 7] 工具返回值清洗：外部内容（网页、搜索结果）可能含指令注入
+            from app.orchestrator.prompt_safety import sanitize_tool_result
+
+            sanitized_result = sanitize_tool_result(result)
             return ToolResult(
                 tool_name=tool_name,
                 arguments=arguments,
                 success=True,
-                result=result,
+                result=sanitized_result,
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
         except Exception as e:
@@ -247,10 +255,32 @@ class ReactLoop:
         compute: AgentCompute | None = None,
         tools: ToolRegistry | None = None,
         meeting_id: str = "",
+        on_tool_event: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     ) -> None:
         self._compute = compute or get_compute()
         self._tools = tools or ToolRegistry()
         self._meeting_id = meeting_id  # 用于注入到浏览器工具调用中
+        self._on_tool_event = on_tool_event  # 工具事件回调（用于 WS 推送）
+
+    def _make_step_callback(self, call_id: str, tool_name: str):
+        """创建工具步骤回调，供 browser/web_search 工具推送中间步骤事件"""
+
+        async def _cb(step_type: str, step_data: dict[str, Any]) -> None:
+            if self._on_tool_event is None:
+                return
+            with contextlib.suppress(Exception):
+                await self._on_tool_event(
+                    "tool.step",
+                    {
+                        "call_id": call_id,
+                        "tool_name": tool_name,
+                        "step_type": step_type,
+                        "data": step_data,
+                        "ts": _now_iso(),
+                    },
+                )
+
+        return _cb
 
     async def run(
         self,
@@ -327,16 +357,64 @@ class ReactLoop:
 
             # 4. Act: 执行工具调用
             for call in response.tool_calls:
-                # 注入 meeting_id（浏览器工具和工作区工具都需要）
+                # [Wave 3] 安全：强制覆盖 meeting_id，防止 LLM 通过工具参数注入其他会议 ID
+                # 旧代码用 setdefault 允许 LLM 覆盖 meeting_id，存在跨租户数据泄露风险
                 args = dict(call.arguments)
                 if self._meeting_id:
-                    # 所有工具都可能需要 meeting_id（用于文件隔离、浏览器上下文等）
-                    args.setdefault("meeting_id", self._meeting_id)
-                # 记录工具调用成本
-                time.monotonic()
+                    args["meeting_id"] = self._meeting_id  # 强制覆盖，不接受 LLM 提供的值
+
+                # 生成工具调用 ID
+                call_id = f"tool-{iteration}-{call.tool_name}-{id(call) & 0xFFFF:04x}"
+
+                # 推送 tool.started 事件
+                if self._on_tool_event is not None:
+                    with contextlib.suppress(Exception):
+                        await self._on_tool_event(
+                            "tool.started",
+                            {
+                                "call_id": call_id,
+                                "tool_name": call.tool_name,
+                                "arguments": _sanitize_args(args),
+                                "reason": call.reason,
+                                "iteration": iteration,
+                                "ts": _now_iso(),
+                            },
+                        )
+
+                # 为 browser / 搜索 / 代码类工具注入步骤回调（tool.step 监控回放）
+                if call.tool_name.startswith("browser.") or call.tool_name in (
+                    "web_search",
+                    "web_fetch",
+                    "code.retrieve",
+                    "code.structure",
+                ):
+                    args["_step_callback"] = self._make_step_callback(call_id, call.tool_name)
+
+                t0 = time.monotonic()
                 result = await self._tools.execute(call.tool_name, args)
+                latency_ms = int((time.monotonic() - t0) * 1000)
                 result.iteration = iteration
+                result.latency_ms = latency_ms
                 tool_history.append(result)
+
+                # 推送 tool.completed / tool.failed 事件
+                if self._on_tool_event is not None:
+                    try:
+                        event_type = "tool.completed" if result.success else "tool.failed"
+                        await self._on_tool_event(
+                            event_type,
+                            {
+                                "call_id": call_id,
+                                "tool_name": call.tool_name,
+                                "success": result.success,
+                                "error": result.error[:500] if result.error else "",
+                                "latency_ms": latency_ms,
+                                "summary": _summarize_result(result.result, call.tool_name),
+                                "ts": _now_iso(),
+                            },
+                        )
+                    except Exception:
+                        pass
 
                 # 记录到 CostTracker
                 try:
@@ -388,13 +466,83 @@ class ReactLoop:
         )
 
 
+# ---------- 中间步骤事件（tool.step）发射助手 ----------
+
+# 内联截图 base64 上限（约 200KB），防止 tool.step 事件过大拖垮 WS 与 DB
+_STEP_SCREENSHOT_MAX_BYTES = 200 * 1024
+
+
+async def _emit_step(step_cb: Any, step_type: str, data: dict[str, Any]) -> None:
+    """安全调用步骤回调，未提供回调时静默跳过。
+
+    step_cb 由 ReactLoop.run 经 args["_step_callback"] 注入，回调内部把
+    tool.step 事件发布到事件总线（WS 推送 + PostgreSQL 持久化）。
+    """
+    if step_cb is None:
+        return
+    with contextlib.suppress(Exception):
+        await step_cb(step_type, data)
+
+
+async def _capture_step_screenshot(meeting_id: str) -> dict[str, str] | None:
+    """为浏览器步骤捕获一张 viewport 截图（best-effort）。
+
+    借鉴 Skyvern 的逐步截图记录思路。Phase 2：截图落盘到录制存储，返回
+    {"ref": 文件名}；落盘关闭/失败时降级为 {"inline": base64}（有界）。
+    调用方据此写 events 的 screenshot_ref / screenshot 字段，避免大 base64 进 events。
+    """
+    if not meeting_id:
+        return None
+    try:
+        from app.tools.browser_tool import get_browser_tool
+
+        shot = await get_browser_tool().screenshot(meeting_id, full_page=False)
+        if shot.get("status") != "ok":
+            return None
+        b64 = shot.get("base64")
+        if not b64:
+            return None
+
+        # Phase 2：优先落盘，events 只存引用
+        from app.config import settings
+        from app.services import recording_store
+
+        if settings.recording_enabled:
+            raw = base64.b64decode(b64)
+            if raw and len(raw) <= settings.recording_max_screenshot_bytes:
+                ref = recording_store.save_screenshot(meeting_id, raw)
+                if ref:
+                    return {"ref": ref}
+
+        # 降级：有界内联 base64
+        if len(b64) <= _STEP_SCREENSHOT_MAX_BYTES:
+            return {"inline": b64}
+        return None
+    except Exception:
+        return None
+
+
 # ---------- 默认工具注册表工厂 ----------
 
 
-def create_default_tool_registry() -> ToolRegistry:
-    """创建默认工具注册表（web_search + browser 操作 + workspace 文件/命令工具）
+def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
+    """把 LLM 传来的参数安全收敛为 [lo, hi] 内的 int。
 
-    在 evidence_check 和 produce 节点中使用。
+    LLM 可能给字符串、浮点或越界值；一律兜底为默认值/边界，
+    避免工具调用因参数类型错误直接失败。
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(parsed, hi))
+
+
+def create_default_tool_registry() -> ToolRegistry:
+    """创建默认工具注册表（web_search + browser 操作 + workspace 文件/命令 + 代码检索工具）
+
+    全部六个阶段节点（clarify/intra_team/cross_team/evidence_check/arbitrate/produce）
+    经 _build_tool_registry() 共用本注册表，工具在所有流程环节可用。
     """
     registry = ToolRegistry()
 
@@ -402,8 +550,10 @@ def create_default_tool_registry() -> ToolRegistry:
     async def _web_search(args: dict[str, Any]) -> Any:
         from app.tools import get_web_search
 
+        step_cb = args.get("_step_callback")
         query = args.get("query", "")
         top_k = args.get("top_k", 5)
+        await _emit_step(step_cb, "search_started", {"label": f"搜索：{query}", "status": "running", "query": query})
         tool = get_web_search()
         # 传递可选参数：language, time_range, country, session_key
         kwargs: dict[str, Any] = {}
@@ -414,7 +564,12 @@ def create_default_tool_registry() -> ToolRegistry:
         meeting_id = args.get("meeting_id", "")
         if meeting_id:
             kwargs["session_key"] = str(meeting_id)
-        return await tool.search(query, top_k, **kwargs)
+        result = await tool.search(query, top_k, **kwargs)
+        count = len(result) if isinstance(result, list) else 0
+        await _emit_step(
+            step_cb, "results_found", {"label": f"找到 {count} 条结果", "status": "completed", "count": count}
+        )
+        return result
 
     registry.register(
         "web_search",
@@ -433,10 +588,14 @@ def create_default_tool_registry() -> ToolRegistry:
     async def _web_fetch(args: dict[str, Any]) -> Any:
         from app.tools import get_web_fetch
 
+        step_cb = args.get("_step_callback")
         url = args.get("url", "")
         max_chars = args.get("max_chars", 5000)
+        await _emit_step(step_cb, "fetch_started", {"label": f"抓取：{url}", "status": "running", "url": url})
         tool = get_web_fetch()
-        return await tool.fetch_url(url, max_chars)
+        result = await tool.fetch_url(url, max_chars)
+        await _emit_step(step_cb, "content_extracted", {"label": "正文提取完成", "status": "completed", "url": url})
+        return result
 
     registry.register(
         "web_fetch",
@@ -454,10 +613,29 @@ def create_default_tool_registry() -> ToolRegistry:
     async def _browser_goto(args: dict[str, Any]) -> Any:
         from app.tools.browser_tool import get_browser_tool
 
+        step_cb = args.get("_step_callback")
         tool = get_browser_tool()
         url = str(args.get("url", ""))
         meeting_id = str(args.get("meeting_id", ""))
-        return await tool.goto(meeting_id, url)
+        await _emit_step(step_cb, "navigating", {"label": f"导航到 {url}", "status": "running", "url": url})
+        result = await tool.goto(meeting_id, url)
+        final_url = str((result or {}).get("url") or url)
+        title = str((result or {}).get("title") or "")
+        step_data: dict[str, Any] = {"label": f"已打开 {title or final_url}", "status": "completed", "url": final_url}
+        if title:
+            step_data["title"] = title
+        if (result or {}).get("status") != "ok":
+            step_data["status"] = "failed"
+            step_data["label"] = str((result or {}).get("error") or "导航失败")
+        shot = await _capture_step_screenshot(meeting_id)
+        if shot:
+            if "ref" in shot:
+                # 存相对 URL 路径（外链引用），前端据此带鉴权拉取截图
+                step_data["screenshot_ref"] = f"/meetings/{meeting_id}/recordings/{shot['ref']}"
+            elif "inline" in shot:
+                step_data["screenshot"] = shot["inline"]
+        await _emit_step(step_cb, "page_navigated", step_data)
+        return result
 
     registry.register(
         "browser.goto",
@@ -469,10 +647,14 @@ def create_default_tool_registry() -> ToolRegistry:
     async def _browser_extract(args: dict[str, Any]) -> Any:
         from app.tools.browser_tool import get_browser_tool
 
+        step_cb = args.get("_step_callback")
         tool = get_browser_tool()
         meeting_id = str(args.get("meeting_id", ""))
         max_length = int(args.get("max_length", 5000))
-        return await tool.extract_content(meeting_id, max_length)
+        await _emit_step(step_cb, "extracting", {"label": "提取页面内容", "status": "running"})
+        result = await tool.extract_content(meeting_id, max_length)
+        await _emit_step(step_cb, "content_extracted", {"label": "内容提取完成", "status": "completed"})
+        return result
 
     registry.register(
         "browser.extract",
@@ -484,10 +666,14 @@ def create_default_tool_registry() -> ToolRegistry:
     async def _browser_click(args: dict[str, Any]) -> Any:
         from app.tools.browser_tool import get_browser_tool
 
+        step_cb = args.get("_step_callback")
         tool = get_browser_tool()
         meeting_id = str(args.get("meeting_id", ""))
         selector = str(args.get("selector", ""))
-        return await tool.click(meeting_id, selector)
+        await _emit_step(step_cb, "clicking", {"label": f"点击 {selector}", "status": "running", "selector": selector})
+        result = await tool.click(meeting_id, selector)
+        await _emit_step(step_cb, "clicked", {"label": "点击完成", "status": "completed", "selector": selector})
+        return result
 
     registry.register(
         "browser.click",
@@ -499,10 +685,14 @@ def create_default_tool_registry() -> ToolRegistry:
     async def _browser_scroll(args: dict[str, Any]) -> Any:
         from app.tools.browser_tool import get_browser_tool
 
+        step_cb = args.get("_step_callback")
         tool = get_browser_tool()
         meeting_id = str(args.get("meeting_id", ""))
         amount = int(args.get("amount", 500))
-        return await tool.scroll(meeting_id, "down", amount)
+        await _emit_step(step_cb, "scrolling", {"label": f"滚动 {amount}px", "status": "running", "amount": amount})
+        result = await tool.scroll(meeting_id, "down", amount)
+        await _emit_step(step_cb, "scrolled", {"label": "滚动完成", "status": "completed"})
+        return result
 
     registry.register(
         "browser.scroll",
@@ -514,10 +704,26 @@ def create_default_tool_registry() -> ToolRegistry:
     async def _browser_evaluate(args: dict[str, Any]) -> Any:
         from app.tools.browser_tool import get_browser_tool
 
+        step_cb = args.get("_step_callback")
         tool = get_browser_tool()
         meeting_id = str(args.get("meeting_id", ""))
         expression = str(args.get("expression", "document.title"))
-        return await tool.evaluate(meeting_id, expression)
+        # [Wave 8] JS 表达式安全验证：阻断危险模式（fetch/cookie/eval 等）
+        from app.orchestrator.prompt_safety import validate_js_expression
+
+        is_safe, reason = validate_js_expression(expression)
+        if not is_safe:
+            log_bus.warning(
+                f"browser.evaluate 被安全策略阻断: {reason}",
+                logger="orchestrator.react_loop",
+                extra={"expression_preview": expression[:100], "reason": reason},
+            )
+            await _emit_step(step_cb, "error", {"label": f"脚本被阻断：{reason}", "status": "failed", "reason": reason})
+            return {"status": "blocked", "reason": reason, "expression": expression[:200]}
+        await _emit_step(step_cb, "evaluating", {"label": "执行脚本", "status": "running"})
+        result = await tool.evaluate(meeting_id, expression)
+        await _emit_step(step_cb, "evaluated", {"label": "脚本执行完成", "status": "completed"})
+        return result
 
     registry.register(
         "browser.evaluate",
@@ -536,4 +742,170 @@ def create_default_tool_registry() -> ToolRegistry:
 
         logging.getLogger("orchestrator.react_loop").warning("工作区工具注册失败: %s", str(e)[:200])
 
+    # ========== 代码检索工具（ADR-016 Phase C，[P1 修复] 接入 Agent 工作流）==========
+    # meeting_id 由 ReactLoop 强制注入（跨会议注入防护），检索范围天然限定本会议。
+    # 会议未摄入代码时优雅降级为空结果，不报错。
+
+    async def _code_retrieve(args: dict[str, Any]) -> Any:
+        from app.rag.retriever import retrieve_code
+
+        step_cb = args.get("_step_callback")
+        meeting_id = str(args.get("meeting_id", ""))
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return {"status": "error", "error": "query 不能为空"}
+        top_k = _clamp_int(args.get("top_k", 5), 5, 1, 50)
+        max_hops = _clamp_int(args.get("max_hops", 1), 1, 0, 5)
+        await _emit_step(
+            step_cb,
+            "code_search_started",
+            {"label": f"代码检索：{query[:60]}", "status": "running", "query": query},
+        )
+        results = await retrieve_code(meeting_id, query, top_k=top_k, max_hops=max_hops)
+        await _emit_step(
+            step_cb,
+            "code_search_done",
+            {"label": f"命中 {len(results)} 个代码片段", "status": "completed", "count": len(results)},
+        )
+        return {"status": "ok", "count": len(results), "results": results}
+
+    registry.register(
+        "code.retrieve",
+        "语义检索本会议已导入的代码仓库（向量召回 + 调用图扩展）。当需要定位与某个需求/缺陷/功能相关的代码实现时使用。"
+        "返回相关代码片段列表（含文件路径与内容），图扩展命中的片段带 graph_hit 元数据。"
+        "会议未导入代码或未建索引时返回空列表。",
+        _code_retrieve,
+        {
+            "query": "str（检索查询，描述要找的逻辑，如：用户登录校验实现）",
+            "top_k": "int（可选，返回条数，默认5，最大50）",
+            "max_hops": "int（可选，沿调用图扩展的跳数，默认1，最大5）",
+        },
+    )
+
+    async def _code_structure(args: dict[str, Any]) -> Any:
+        from app.rag.graph_expand import structure_query
+
+        step_cb = args.get("_step_callback")
+        meeting_id = str(args.get("meeting_id", ""))
+        node_id = str(args.get("node_id", "")).strip()
+        if not node_id:
+            return {"status": "error", "error": "node_id 不能为空"}
+        max_hops = _clamp_int(args.get("max_hops", 1), 1, 0, 5)
+        await _emit_step(
+            step_cb,
+            "structure_query_started",
+            {"label": f"结构查询：{node_id[:60]}", "status": "running", "node_id": node_id},
+        )
+        # structure_query 是同步图遍历，放线程池避免阻塞事件循环（P1 异步纪律）
+        result = await asyncio.to_thread(structure_query, meeting_id, node_id, max_hops=max_hops)
+        # structure_query 返回 dict[str, object]，用 isinstance 收窄类型（mypy + 防御异常形状）
+        callers_raw = result.get("callers")
+        deps_raw = result.get("dependencies")
+        callers = callers_raw if isinstance(callers_raw, list) else []
+        deps = deps_raw if isinstance(deps_raw, list) else []
+        await _emit_step(
+            step_cb,
+            "structure_query_done",
+            {
+                "label": f"调用方 {len(callers)} 个，依赖 {len(deps)} 个",
+                "status": "completed",
+                "callers": len(callers),
+                "dependencies": len(deps),
+            },
+        )
+        return {"status": "ok", **result}
+
+    registry.register(
+        "code.structure",
+        "查询代码结构关系：给定符号/文件节点（限定名，如 a.py::ClassA::method_m），返回「谁调用它」（callers）与「它依赖谁」（dependencies）。"
+        "用于评估改动影响面、理解调用链。node_id 可从 code.retrieve 的结果中获得。"
+        "图索引未建立或节点不存在时返回空列表。",
+        _code_structure,
+        {
+            "node_id": "str（符号/文件节点 ID，限定名格式，如 a.py::A::m）",
+            "max_hops": "int（可选，图扩展最大跳数，默认1，最大5）",
+        },
+    )
+
     return registry
+
+
+# ---------- 工具事件辅助函数 ----------
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sanitize_args(args: dict[str, Any]) -> dict[str, Any]:
+    """清洗工具参数，移除内部字段和敏感内容，截断长文本"""
+    safe: dict[str, Any] = {}
+    for k, v in args.items():
+        if k.startswith("_"):
+            continue  # 跳过内部回调等
+        if isinstance(v, str) and len(v) > 500:
+            safe[k] = v[:500] + "...(truncated)"
+        else:
+            safe[k] = v
+    return safe
+
+
+def _summarize_result(result: Any, tool_name: str) -> dict[str, Any]:
+    """从工具返回值中提取摘要信息（不包含完整数据，用于前端快速展示）"""
+    try:
+        if result is None:
+            return {"type": "empty"}
+        if isinstance(result, list):
+            # web_search 返回 evidence 列表
+            if tool_name in ("web_search",):
+                items = []
+                for ev in result[:5]:
+                    if isinstance(ev, dict):
+                        items.append(
+                            {
+                                "url": ev.get("url", ""),
+                                "title": (ev.get("signals") or {}).get("page_title", ""),
+                                "source_tier": ev.get("source_tier", ""),
+                                "domain": ev.get("domain", ""),
+                            }
+                        )
+                return {"type": "search_results", "count": len(result), "items": items}
+            return {"type": "list", "count": len(result)}
+        if isinstance(result, dict):
+            # 代码工具返回（优先于 browser 分支，避免 status=ok 被误判为浏览器动作）
+            if tool_name == "code.retrieve":
+                return {"type": "code_results", "count": result.get("count", 0)}
+            if tool_name == "code.structure":
+                return {
+                    "type": "code_structure",
+                    "node_id": result.get("node_id", ""),
+                    "callers": len(result.get("callers") or []),
+                    "dependencies": len(result.get("dependencies") or []),
+                }
+            status = result.get("status", "")
+            if status in ("ok", "error", "captcha", "blocked"):
+                # browser 工具返回
+                summary: dict[str, Any] = {"type": "browser_action", "status": status}
+                url = result.get("url") or (result.get("data") or {}).get("url", "")
+                title = (result.get("data") or {}).get("title", "")
+                if url:
+                    summary["url"] = url
+                if title:
+                    summary["title"] = title[:100]
+                if result.get("error"):
+                    summary["error"] = str(result["error"])[:200]
+                if result.get("base64"):
+                    summary["has_screenshot"] = True
+                return summary
+            # web_fetch 返回
+            if "content" in result or "chunks" in result:
+                return {
+                    "type": "page_content",
+                    "url": result.get("url", ""),
+                    "title": (result.get("signals") or {}).get("page_title", ""),
+                    "content_length": len(str(result.get("content", ""))),
+                }
+            return {"type": "dict", "keys": list(result.keys())[:10]}
+        return {"type": "value", "preview": str(result)[:200]}
+    except Exception:
+        return {"type": "unknown"}

@@ -121,6 +121,9 @@ class MeetingIterationSection(BaseModel):
     max_iterations: int = 2
     quality_score: float | None = None
     quality_feedback: str | None = None
+    # 完整质量评估结果（8 维评分明细 + hard_failures + deploy_ok 等）
+    # 与 quality_score/quality_feedback 的关系：后两者是从此 dict 中提取的标量摘要
+    quality_evaluation: dict[str, Any] | None = None
     iteration_history: list[dict[str, Any]] = Field(default_factory=list)
     auto_iterate: bool = False
     checkpoint: dict[str, Any] | None = None
@@ -134,8 +137,13 @@ class MeetingObservabilitySection(BaseModel):
     decision_record: dict[str, Any] | None = None
     artifact: dict[str, Any] | None = None
     doc_summaries: list[str] = Field(default_factory=list)
+    code_repos: list[dict[str, Any]] = Field(default_factory=list)
     reference_meeting_ids: list[str] = Field(default_factory=list)
     reference_context: str = ""
+    source_artifact_ids: list[str] = Field(default_factory=list)
+    # ADR-017 Phase 2：会议归属的项目/议题（从议题发起会议时自动回填）
+    project_id: str | None = None
+    issue_id: str | None = None
     charter: MeetingCharter | None = None
     conclusion_chain: ConclusionChain = Field(default_factory=ConclusionChain)
     llm_trace: CallTrace = Field(default_factory=CallTrace)
@@ -184,6 +192,19 @@ class MeetingState(BaseModel):
     # "simple" = 简化路由（映射到 instant）
     # 兼容旧值："fast"/"fast_path"→instant, "deep_think"/"full"→standard
     flow_plan: str = "standard"
+    # ADR-014 Phase 2: 工作流模板 ID（clarify 阶段设置，Runner 据此选择阶段序列）
+    # "standard" = 默认六阶段管线（向后兼容）
+    # "design" / "build" / "research" / "analysis" = 按议题类型定制阶段序列
+    workflow_template: str = "standard"
+    # ADR-014 Phase 3: 议题拆分结果（序列化 TopicDecomposition）
+    # clarify 阶段后若 complexity=full 且非 standard 模板，调用 LLM 拆分为子议题 DAG
+    # None = 未拆分（默认），dict = 已拆分的 TopicDecomposition 序列化
+    topic_decomposition: dict[str, Any] | None = None
+    # ADR-014 Phase 3: 各子议题的执行结果
+    # 每项: {"subtopic_id": "...", "title": "...", "result": {...}, "artifact": {...}}
+    subtopic_results: list[dict[str, Any]] = Field(default_factory=list)
+    # ADR-014 Phase 3: 当前执行的子议题索引（-1 = 未进入子议题模式）
+    current_subtopic_idx: int = -1
     # 辩论深度：轻量(light) / 标准(standard) / 深度(deep)
     # - light: 2-3 Agents, 1 轮队内发言, 跳过跨队辩论和证据核验
     # - standard: 3-5 Agents, 2-3 轮辩论, 标准流程
@@ -198,10 +219,26 @@ class MeetingState(BaseModel):
     # 格式: {role_or_stage: "provider_id:model_id"}
     # key 可以是角色 id（如 "engineer"）或 @阶段名（如 "@arbitrate"）
     resolved_models: dict[str, str] = Field(default_factory=dict)
+    # 记录 resolved_models 是基于哪个 model_override 值解析的
+    # resume 时如果 model_override 已变更，则重新 resolve 模型快照
+    resolved_from_model_override: str = ""
     paused_snapshot: dict[str, Any] | None = None
     doc_summaries: list[str] = Field(default_factory=list)  # 上传资料摘要
+    # 已摄入的代码仓库清单（routers/code.py ingest_code 成功后登记，[P1 修复]）
+    # 每项: {"name": "...", "path": "...", "source_type": "git|zip",
+    #        "file_count": int, "size_bytes": int, "indexed": bool}
+    # 供 prompt 代码锚点（conclave_core.anchor.get_code_anchor）注入各阶段，
+    # 让 LLM 感知"会议已导入哪些代码、在哪里、可否检索"。
+    code_repos: list[dict[str, Any]] = Field(default_factory=list)
     reference_meeting_ids: list[str] = Field(default_factory=list)  # 引用的历史会议 ID 列表
     reference_context: str = ""  # 引用会议摘要文本（注入 prompt）
+    # ADR-017 Phase 1：引用的上游产物 ID 列表（产物级血缘，区别于会议级引用）
+    # 创建会议时校验租户归属后写入；publish 时随产物入 artifacts.source_artifact_ids
+    source_artifact_ids: list[str] = Field(default_factory=list)
+    # ADR-017 Phase 2：会议归属的项目/议题（从议题发起会议时自动回填；
+    # publish 挂钩据此闭环议题，abort 挂钩据此释放议题回池）
+    project_id: str | None = None
+    issue_id: str | None = None
     # 会议宪章（clarify 阶段构造，作为后续阶段防漂移的不变锚点）
     charter: MeetingCharter | None = None
     # 漂移检查日志（非阻塞，记录每条发言的 drift 判定）
@@ -212,6 +249,13 @@ class MeetingState(BaseModel):
     llm_trace: CallTrace = Field(default_factory=CallTrace)
     # 第5层：置信度标记（stage -> "high"|"low"|"fallback"）
     confidence_flags: dict[str, str] = Field(default_factory=dict)
+    # ADR-010: cross_team 质量门禁决策历史
+    # 每项: {"round": 1, "decision": "pass|supplement|re_examine", "reason": "...", "target_roles": [...]}
+    gate_history: list[dict[str, Any]] = Field(default_factory=list)
+    # ADR-010: 门禁待执行动作（驱动回流，消费后清空）
+    # 格式: {"action": "supplement"|"re_examine", "round": int, "reason": "...",
+    #        "target_roles": [...], "weak_dimensions": [...]}
+    gate_pending_action: dict[str, Any] | None = None
     # 借调的 agent 列表（loan 信号裁决通过后追加，待发言）
     # 每项: {"role": "security_expert", "verdict": "approve_temporary",
     #        "spoken": False, "request": {...}}
@@ -256,6 +300,13 @@ class MeetingState(BaseModel):
     # stage_retry_count: 各阶段重试次数 {stage_name: int}
     stage_retry_count: dict[str, int] = Field(default_factory=dict)
     max_stage_retries: int = 2  # 每个阶段最大重试次数
+    # intra_team 子步骤检查点：记录已产出 claims 的角色 ID
+    # 阶段内断点续传时，已完成的角色不再重复执行，仅运行未完成的角色
+    # 阶段完成后清空
+    completed_roles: list[str] = Field(default_factory=list)
+    # intra_team 子步骤检查点：已完成角色的产出结果（配合 completed_roles 使用）
+    # gather 失败时保留已完成角色的结果，resume 时合并到 run_intra_team 的输入
+    intra_team_partial_results: list[dict[str, Any]] = Field(default_factory=list)
     # === 自我迭代 Loop ===
     # iteration_count: 当前迭代轮次（0=首轮，1+=迭代轮）
     iteration_count: int = 0
@@ -263,10 +314,18 @@ class MeetingState(BaseModel):
     # quality_score: 产出质量评分（0-100），由质量门禁评估
     quality_score: float | None = None
     quality_feedback: str | None = None  # 质量门禁的反馈意见（用于下一轮迭代）
+    # 完整质量评估结果（8 维评分明细 + hard_failures + deploy_ok 等）
+    quality_evaluation: dict[str, Any] | None = None
     # iteration_history: 历次迭代记录 [{iteration, quality_score, feedback, changes}]
     iteration_history: list[dict[str, Any]] = Field(default_factory=list)
     # auto_iterate: 是否自动迭代直到质量达标（用户可设置）
     auto_iterate: bool = False
+
+    # degradation_warnings: 中间阶段退化告警列表
+    # 每个 entry: {stage, warning_type, detail, timestamp, severity}
+    # 由 _check_intermediate_degradation() 在中间阶段完成后填充，
+    # 不触发迭代（中间阶段迭代成本太高），仅记录供审计和根因分析。
+    degradation_warnings: list[dict[str, Any]] = Field(default_factory=list)
 
     # [SECURITY-FIX] 消息列表上限：超过此数量时裁剪最旧消息（保留上下文窗口）
     MAX_MESSAGES: int = 500
@@ -411,6 +470,7 @@ class MeetingState(BaseModel):
                 max_iterations=self.max_iterations,
                 quality_score=self.quality_score,
                 quality_feedback=self.quality_feedback,
+                quality_evaluation=self.quality_evaluation,
                 iteration_history=self.iteration_history,
                 auto_iterate=self.auto_iterate,
                 checkpoint=self.checkpoint,
@@ -421,8 +481,12 @@ class MeetingState(BaseModel):
                 decision_record=self.decision_record,
                 artifact=self.artifact,
                 doc_summaries=self.doc_summaries,
+                code_repos=self.code_repos,
                 reference_meeting_ids=self.reference_meeting_ids,
                 reference_context=self.reference_context,
+                source_artifact_ids=self.source_artifact_ids,
+                project_id=self.project_id,
+                issue_id=self.issue_id,
                 charter=self.charter,
                 conclusion_chain=self.conclusion_chain,
                 llm_trace=self.llm_trace,

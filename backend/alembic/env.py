@@ -6,6 +6,7 @@
 不能直接 `python alembic/env.py` 运行。`from alembic import context` 中的 `context`
 是 Alembic 框架在运行时注入的全局对象（类似 Flask 的 `g`），独立运行时不存在。
 """
+
 import asyncio
 from logging.config import fileConfig
 
@@ -20,6 +21,7 @@ from app.db.base import Base
 from app.db.models import (  # noqa: F401
     AgentRoleModel,
     ApiKeyModel,
+    AuditLogModel,
     CostRecordModel,
     DocumentModel,
     EventModel,
@@ -28,7 +30,6 @@ from app.db.models import (  # noqa: F401
     MeetingModel,
     MeetingTagModel,
     MessageModel,
-    NetAuthRequestModel,
     ProfileMemoryModel,
     RawMemoryModel,
     UserPreferenceModel,

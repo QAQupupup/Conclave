@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse, Response
 
 from app.context import new_request_id, reset_request_id, set_request_id
 from app.logging_config import get_logger
+from app.public_paths import is_public_path as _is_public_path
 
 logger = get_logger("middleware.trace")
 
@@ -54,19 +55,6 @@ def _load_or_create_dev_token() -> str:
 
 
 _DEV_TOKEN = _load_or_create_dev_token()
-
-# 免认证路径前缀
-_PUBLIC_PATHS = {
-    "/health",
-    "/metrics",
-    "/docs",
-    "/openapi.json",
-    "/redoc",
-    "/debug/auth-info",
-    "/auth/login",
-}
-# WebSocket 升级路径免认证（WebSocket 在 query 参数中传 token）
-_WS_PATHS = {"/ws"}
 
 # ---- 速率限制 ----
 _RATE_LIMIT_PER_MIN = int(os.environ.get("CONCLAVE_RATE_LIMIT_PER_MIN", "600"))
@@ -242,18 +230,8 @@ def _normalize_path(path: str) -> str:
 
 
 def _is_public(path: str) -> bool:
-    """判断路径是否免认证
-
-    [M-05 修复] 使用规范化路径 + 精确匹配/目录前缀匹配，防止编码绕过。
-    """
-    norm = _normalize_path(path)
-    for p in _PUBLIC_PATHS:
-        if norm == p:
-            return True
-        # 子路径匹配：/auth/login/xxx 也应视为公开（虽然目前没有子路由，保留扩展性）
-        if norm.startswith(p + "/"):
-            return True
-    return False
+    """判断路径是否免认证（委托给 app.public_paths.is_public_path）。"""
+    return _is_public_path(_normalize_path(path))
 
 
 def setup_auth_middleware(app: FastAPI) -> None:
@@ -341,7 +319,8 @@ def setup_auth_middleware(app: FastAPI) -> None:
             from app.auth import decode_token
 
             auth_user = decode_token(token)
-        except Exception:
+        except Exception as e:
+            logger.debug("JWT token 解码失败，降级到 dev token: %s", e)
             auth_user = None
 
         if auth_user:
@@ -386,8 +365,8 @@ def setup_auth_middleware(app: FastAPI) -> None:
                     },
                     ip=client_ip_str,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("记录速率限制审计日志失败: %s", e)
             return JSONResponse(
                 status_code=429,
                 content={"detail": f"认证失败过多：{_reason2}"},
@@ -407,8 +386,8 @@ def setup_auth_middleware(app: FastAPI) -> None:
                 },
                 ip=client_ip_str,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("记录未授权访问审计日志失败: %s", e)
         return JSONResponse(
             status_code=401,
             content={"detail": "认证失败：token 无效或已过期"},
@@ -481,8 +460,8 @@ def setup_trace_middleware(app: FastAPI) -> None:
             from app.observability.metrics_store import get_metrics_store
 
             get_metrics_store().record_request(elapsed)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("记录请求指标失败: %s", e)
 
         if status >= 500:
             logger.error(
@@ -507,8 +486,8 @@ def setup_trace_middleware(app: FastAPI) -> None:
                     },
                     duration_ms=int(elapsed),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("记录 5xx 错误审计日志失败: %s", e)
         elif status >= 400:
             logger.warning(
                 "request_id=%s %s %s %d %.0fms",
@@ -554,8 +533,8 @@ def setup_trace_middleware(app: FastAPI) -> None:
                         duration_ms=int(elapsed),
                         ip=_client_ip(request),
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("记录写操作审计日志失败: %s", e)
 
         response.headers["X-Request-Id"] = rid
         return response
@@ -642,8 +621,8 @@ def reset_auth_failures(ip: str) -> None:
         with _rate_lock:
             _fail_log.pop(ip or "unknown", None)
             _blocked_ips.pop(ip or "unknown", None)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("清除认证失败记录异常: %s", e)
 
 
 def verify_ws_token(token: str) -> dict | None:
@@ -660,8 +639,8 @@ def verify_ws_token(token: str) -> dict | None:
         user = decode_token(token)
         if user:
             return user
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("WebSocket JWT token 解码失败: %s", e)
     # Dev token
     if hmac.compare_digest(token.encode("utf-8"), _DEV_TOKEN.encode("utf-8")):
         return {"username": "dev", "role": "admin", "uid": None}

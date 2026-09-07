@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.context import get_meeting_id, get_request_id, get_runner_session_id
+from app.lazy_asyncio import LazyLock
 
 # 保存对后台刷盘任务的引用，防止被垃圾回收
 _flush_tasks: set[asyncio.Task] = set()
@@ -134,7 +135,7 @@ class CostTracker:
 
     def __init__(self) -> None:
         self._records: list[CostRecord] = []
-        self._lock = asyncio.Lock()
+        self._lock = LazyLock()  # 延迟初始化，避免跨事件循环绑定
 
     def _get_trace_id(self) -> str:
         """获取当前上下文的 trace_id（复用 runner_session_id）"""
@@ -241,19 +242,26 @@ class CostTracker:
         except RuntimeError:
             pass  # 无事件循环时跳过（测试/脚本场景）
 
-    def summary(self) -> dict[str, Any]:
-        """返回成本汇总（按 node / tool 聚合）"""
-        total_cost = sum(r.cost_usd for r in self._records)
-        total_tokens = sum(r.total_tokens for r in self._records)
-        total_llm_tokens = sum(r.total_tokens for r in self._records if r.tool_name == "llm")
-        total_calls = len(self._records)
-        llm_calls = sum(1 for r in self._records if r.tool_name == "llm")
+    def summary(self, meeting_id: str | None = None) -> dict[str, Any]:
+        """返回成本汇总（按 node / tool 聚合）
+
+        Args:
+            meeting_id: 若提供，仅汇总该会议的记录；None 时汇总全部（运维面板全局视图）
+        """
+        records = self._records
+        if meeting_id is not None:
+            records = [r for r in self._records if r.meeting_id == meeting_id]
+        total_cost = sum(r.cost_usd for r in records)
+        total_tokens = sum(r.total_tokens for r in records)
+        total_llm_tokens = sum(r.total_tokens for r in records if r.tool_name == "llm")
+        total_calls = len(records)
+        llm_calls = sum(1 for r in records if r.tool_name == "llm")
         tool_calls = total_calls - llm_calls
-        errors = sum(1 for r in self._records if r.status == "error")
+        errors = sum(1 for r in records if r.status == "error")
 
         # 按 node 聚合
         by_node: dict[str, dict[str, Any]] = {}
-        for r in self._records:
+        for r in records:
             n = by_node.setdefault(r.node, {"calls": 0, "cost_usd": 0.0, "tokens": 0, "latency_ms": 0})
             n["calls"] += 1
             n["cost_usd"] += r.cost_usd
@@ -262,7 +270,7 @@ class CostTracker:
 
         # 按 tool 聚合
         by_tool: dict[str, dict[str, Any]] = {}
-        for r in self._records:
+        for r in records:
             t = by_tool.setdefault(r.tool_name, {"calls": 0, "cost_usd": 0.0, "tokens": 0, "latency_ms": 0})
             t["calls"] += 1
             t["cost_usd"] += r.cost_usd

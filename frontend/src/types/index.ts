@@ -1,0 +1,71 @@
+export type {
+  StageId,
+  MeetingStatus,
+  AgentRole,
+  AgentState,
+  WsConnectionStatus,
+  AgentInfo,
+  WsMessage,
+  MeetingMessage,
+  Meeting,
+  BorrowRequest,
+  TenantInfo,
+  UserInfo,
+  AuthState,
+  ToolCallStatus,
+  ToolStep,
+  ToolCallRecord,
+} from './meeting';
+
+export type {
+  AGUIEventType,
+  AGUIEvent,
+  TextMessageStartEvent,
+  TextMessageDeltaEvent,
+  TextMessageEndEvent,
+  ThinkingStartEvent,
+  ThinkingDeltaEvent,
+  ThinkingEndEvent,
+  ToolCallStartEvent,
+  ToolCallStepEvent,
+  ToolCallEndEvent,
+  StateDeltaEvent,
+  InterruptEvent,
+  CustomEvent,
+} from './ag-ui';
+
+export type {
+  ApiError,
+  PaginatedResponse,
+  Artifact,
+  ArtifactListResponse,
+  ArtifactLineageNode,
+  ArtifactLineageEdge,
+  ArtifactLineageResponse,
+  IssueStatus,
+  Project,
+  ProjectDetail,
+  ProjectListResponse,
+  CreateProjectRequest,
+  UpdateProjectRequest,
+  Issue,
+  IssueListResponse,
+  CreateIssueRequest,
+  UpdateIssueRequest,
+  MergeIssueRequest,
+  MergePreviewResponse,
+  MergeExecuteResponse,
+} from './api';
+
+// RBAC / Team 多租户
+export type {
+  SystemRole,
+  TeamRole,
+  TeamMember,
+  TeamDetail,
+  TeamListResponse,
+  TeamMemberListResponse,
+  EffectiveConfig,
+  TeamRoleMeta,
+} from './rbac';
+export { TEAM_ROLE_META, canManageRole, getAssignableRoles } from './rbac';

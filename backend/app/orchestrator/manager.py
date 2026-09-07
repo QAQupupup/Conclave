@@ -51,6 +51,15 @@ class MeetingManager:
         if stage == "produce":
             return await reduce_stage_results(state, stage, {})
 
+        # evidence_check 阶段：需要 RAG 检索 + ReactLoop 多轮工具调用，
+        # 新的 Scheduler 路径（AgentRuntime.execute）暂不支持证据检索，
+        # 回退到 legacy 节点 evidence_check_node（含并行 RAG 检索 + 一致性自检）。
+        # 后续 AgentRuntime 支持工具调用后再迁移到统一路径。
+        if stage == "evidence_check":
+            from app.orchestrator.nodes.evidence_check import evidence_check_node
+
+            return await evidence_check_node(state)
+
         baseline = baseline or self.select_baseline(
             state.topic if hasattr(state, "topic") else "",
             state.domain_hint if hasattr(state, "domain_hint") else "",
@@ -136,8 +145,10 @@ class MeetingManager:
 
     # ---------- 统一交互层（后续逐步替换 Runner 中直接调用） ----------
     async def persist_state(self, state: Any) -> None:
-        """持久化状态到 PostgreSQL（通过 db_legacy）"""
-        from app.db_legacy import save_meeting, save_meeting_aux, save_message
+        """持久化状态到 PostgreSQL（通过 app.dao 异步 DAO）"""
+        from app.dao.meeting_aux_dao import save_meeting_aux
+        from app.dao.meeting_dao import save_meeting
+        from app.dao.message_dao import save_message
 
         aux = state.extract_aux() if hasattr(state, "extract_aux") else {}
         await save_meeting(

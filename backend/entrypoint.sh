@@ -116,7 +116,9 @@ if [ "$DOCKER_READY" = "1" ]; then
         else
             echo "[entrypoint] Building data-science sandbox image (pandas/numpy/matplotlib/sklearn...)..."
             DS_CONTEXT=$(dirname "$DATASCIENCE_DOCKERFILE")
-            if su -s /bin/bash "$APP_USER" -c "docker build -t '$DATASCIENCE_IMAGE' -f '$DATASCIENCE_DOCKERFILE' '$DS_CONTEXT'" 2>&1 | tail -50; then
+            # [修复] 传入标准沙箱镜像作为构建参数，确保 FROM 使用已缓存的本地镜像
+            # 避免数据科学 Dockerfile 独立拉取基础镜像失败
+            if su -s /bin/bash "$APP_USER" -c "docker build --build-arg SANDBOX_IMAGE='$SANDBOX_IMAGE' -t '$DATASCIENCE_IMAGE' -f '$DATASCIENCE_DOCKERFILE' '$DS_CONTEXT'" 2>&1 | tail -50; then
                 echo "[entrypoint] Data-science image built successfully"
             else
                 echo "[entrypoint] WARNING: Failed to build data-science image; analysis features will use standard image"
@@ -131,4 +133,5 @@ fi
 chown -R "$APP_UID:$APP_GID" /workspace /app/data 2>/dev/null || true
 
 echo "[entrypoint] Starting uvicorn as $APP_USER (uid=$APP_UID)..."
-exec su -s /bin/bash "$APP_USER" -c "cd /app && exec python -m uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --loop uvloop"
+# [安全加固] --no-server-header 隐藏 uvicorn 版本标识，避免指纹识别
+exec su -s /bin/bash "$APP_USER" -c "cd /app && exec python -m uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --loop uvloop --no-server-header"

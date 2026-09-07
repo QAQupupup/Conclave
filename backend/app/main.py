@@ -10,31 +10,42 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import text
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.auth import init_auth as init_jwt_auth  # noqa: F401  # 保留供外部引用，实际初始化由 auth 插件完成
 from app.core.exceptions import AppException
 from app.db.base import Base
 from app.db.engine import async_session_factory
 from app.db.redis import close_redis, init_redis
-from app.db_legacy import init_db
 from app.events import start_event_bus, stop_event_bus
 from app.logging_config import setup_logging
 from app.middleware import setup_trace_middleware
 from app.net_auth import init_auth_table
 from app.plugins import PluginRegistry, set_global_registry
+from app.routers import admin as admin_router
 from app.routers import agent_roles as agent_roles_router
+from app.routers import artifacts as artifacts_router
 from app.routers import audit_logs as audit_router
 from app.routers import captcha as captcha_router
+from app.routers import code as code_router
+from app.routers import config as config_router
 from app.routers import docker_hosts as docker_hosts_router
 from app.routers import documents as documents_router
+from app.routers import graph as graph_router
+from app.routers import issues as issues_router
 from app.routers import meetings as meetings_router
 from app.routers import metrics as metrics_router
 from app.routers import net_auth as net_auth_router
+from app.routers import notifications as notifications_router
 from app.routers import preferences as preferences_router
+from app.routers import projects as projects_router
 from app.routers import regression as regression_router
+from app.routers import system as system_router
+from app.routers import teams as teams_router
 from app.routers import workspace as workspace_router
 from app.routers import ws as ws_router
 from app.utils.tasks import create_supervised_task
@@ -79,8 +90,8 @@ def _cleanup_orphaned_workspaces() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时初始化数据库 + 崩溃恢复 + 后台指标采集"""
-    # PostgreSQL 兼容层（db_legacy，逐步迁移到 async Repository）
-    await init_db()
+    # 建表单一入口：ORM 表走 Base.metadata.create_all()（见下方 db_mode 分支），
+    # 增量变更走 Alembic；raw SQL ensure 函数仅用于少数 legacy 表（见 docs/sql-development-rules.md §5）
     await init_auth_table()
     # 注意：JWT 用户认证系统（init_auth）由 auth CORE 插件 on_startup 处理，此处不再直接调用
 
@@ -90,6 +101,59 @@ async def lifespan(app: FastAPI):
     if settings.db_mode == "postgresql":
         async with async_session_factory() as session, session.bind.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)  # type: ignore[union-attr]
+
+    # RBAC 多租户：建表 + Casbin 初始化
+    try:
+        from app.rbac import ensure_rbac_tables, init_rbac
+        from app.rbac.policies import (
+            ROLE_BANNED,
+            seed_default_policies,
+            seed_team_policies,
+        )
+
+        await ensure_rbac_tables()
+        await init_rbac()
+
+        # 确保默认系统策略存在
+        await seed_default_policies()
+
+        # 为现有租户 seed Casbin 策略（幂等）
+        from sqlalchemy import select as _sel
+
+        from app.db.models import TenantModel
+
+        async with async_session_factory() as _s:
+            _tenants = (await _s.execute(_sel(TenantModel.id))).scalars().all()
+            for _tid in _tenants:
+                await seed_team_policies(_tid)
+
+        # 为现有用户同步 Casbin 角色（从 tenant_members 表，幂等）
+        from app.db.models import TenantMemberModel as _TM
+        from app.rbac.enforcer import get_enforcer as _get_enf
+        from app.rbac.enforcer import team_domain as _tdom
+
+        async with async_session_factory() as _s:
+            _members = (await _s.execute(_sel(_TM))).scalars().all()
+            _e = _get_enf()
+            for _m in _members:
+                _role = ROLE_BANNED if _m.is_banned else _m.role
+                await _e.add_grouping_policy(str(_m.user_id), _role, _tdom(_m.tenant_id))
+            await _e.save_policy()
+
+        logger.info("RBAC Casbin 初始化完成（%d 个租户，%d 个成员记录）", len(_tenants), len(_members))
+    except Exception as e:
+        logger.error("RBAC 初始化失败（致命）: %s: %s", type(e).__name__, str(e)[:300])
+        raise
+
+    # Schema 一致性校验（防止 ORM 与 raw SQL DDL 双源真相）
+    # 仅在 PostgreSQL 模式且非测试环境下做硬校验；测试环境在 conftest 中单独调用
+    if settings.db_mode == "postgresql" and not os.environ.get("CONCLAVE_TEST_MODE"):
+        try:
+            from app.db.schema_verify import verify_schema_consistency
+
+            await verify_schema_consistency(raise_on_error=False)  # 启动时仅警告，不阻断
+        except Exception as e:
+            logger.warning("Schema 校验执行失败（非致命）: %s", e)
 
     # 记忆子系统初始化（从 PG 恢复画像/特征/原始发言到内存）
     from app.memory.store import memory_store
@@ -125,6 +189,16 @@ async def lifespan(app: FastAPI):
 
     # 启动时扫描工作区孤立目录
     _cleanup_orphaned_workspaces()
+
+    # 启动时清理过期录制文件（操作回放截图保留策略，非致命）
+    try:
+        from app.services.recording_store import cleanup_expired
+
+        removed = cleanup_expired()
+        if removed:
+            logger.info("启动时清理过期录制文件：%d 个会议目录", removed)
+    except Exception as e:
+        logger.warning("录制文件保留清理失败（非致命）: %s", e)
 
     # Redis 初始化（不可用时降级，不阻塞启动）
     await init_redis(app)
@@ -170,6 +244,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # ===== 关闭阶段（逆序：先业务资源，后基础设施）=====
     # 关闭插件系统（逆序 shutdown，在基础设施关闭之前）
     try:
         await app.state.plugin_registry.shutdown_all()
@@ -179,48 +254,80 @@ async def lifespan(app: FastAPI):
     stop_rate_limit_cleanup()
     # 停止后台指标采集
     if os.environ.get("CONCLAVE_DISABLE_METRICS") != "1":
-        await get_metrics_store().stop()
+        try:
+            await get_metrics_store().stop()
+        except Exception as e:
+            logger.warning("指标采集停止异常（非致命）: %s", e)
     # 停止事件总线 Redis Pub/Sub 桥接（必须在 close_redis 之前）
-    await stop_event_bus()
+    try:
+        await stop_event_bus()
+    except Exception as e:
+        logger.warning("事件总线停止异常（非致命）: %s", e)
     # 关闭 Redis
-    await close_redis(app)
+    try:
+        await close_redis(app)
+    except Exception as e:
+        logger.warning("Redis 关闭异常（非致命）: %s", e)
     # 清理所有沙箱服务容器
     try:
         from app.sandbox import cleanup_all_services
 
         await cleanup_all_services()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("沙箱清理异常（非致命）: %s", e)
     # 关闭 LLM 底层 httpx 连接池
     try:
         from app.agents.compute import shutdown_compute
 
         await shutdown_compute()
-    except Exception:
-        pass
-    # 关闭 Playwright 浏览器
+    except Exception as e:
+        logger.warning("LLM 连接池关闭异常（非致命）: %s", e)
+    # 关闭 Playwright 浏览器（browser_tool + playwright_search）
     try:
         from app.tools.browser_tool import close_browser_tool
 
         await close_browser_tool()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("browser_tool 关闭异常（非致命）: %s", e)
+    try:
+        from app.tools.playwright_search import close_playwright_search
+
+        await close_playwright_search()
+    except Exception as e:
+        logger.warning("playwright_search 关闭异常（非致命）: %s", e)
     # 关闭 network_security 的异步 httpx 连接池
     try:
         from app.network_security import shutdown_async_client
 
         await shutdown_async_client()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("network_security 连接池关闭异常（非致命）: %s", e)
+    # 关闭数据库引擎连接池（释放 PG 连接）
+    try:
+        from app.db.engine import get_engine
+
+        engine = await get_engine()
+        await engine.dispose()
+        logger.info("数据库引擎连接池已释放")
+    except Exception as e:
+        logger.warning("数据库引擎释放异常（非致命）: %s", e)
 
 
 def create_app() -> FastAPI:
     """构造 FastAPI 应用"""
+    # [安全加固] 通过环境变量控制是否暴露 API 文档（生产环境默认关闭，避免暴露完整 API schema）
+    _docs_url = "/docs" if os.environ.get("CONCLAVE_ENABLE_DOCS", "0") == "1" else None
+    _redoc_url = "/redoc" if os.environ.get("CONCLAVE_ENABLE_DOCS", "0") == "1" else None
+    _openapi_url = "/openapi.json" if os.environ.get("CONCLAVE_ENABLE_DOCS", "0") == "1" else None
+
     app = FastAPI(
         title="Conclave",
         description="会议型多智能体系统后端",
         version="0.3.0",
         lifespan=lifespan,
+        docs_url=_docs_url,
+        redoc_url=_redoc_url,
+        openapi_url=_openapi_url,
     )
 
     # 插件系统：创建全局注册中心，注册内置 CORE 插件
@@ -263,8 +370,6 @@ def create_app() -> FastAPI:
         if request.method in ("POST", "PUT", "PATCH"):
             content_length = request.headers.get("content-length")
             if content_length and int(content_length) > _max_body_size:
-                from fastapi.responses import JSONResponse
-
                 return JSONResponse(
                     status_code=413,
                     content={
@@ -272,6 +377,24 @@ def create_app() -> FastAPI:
                     },
                 )
         return await call_next(request)
+
+    # [安全加固] 指纹隐藏中间件：剥离 Server/X-Powered-By 头，添加基础安全头
+    @app.middleware("http")
+    async def security_headers_middleware(request: Request, call_next):
+        response: Response = await call_next(request)
+        # 剥离可能暴露后端框架/版本的响应头（MutableHeaders 支持 del）
+        for _h in ("server", "x-powered-by", "x-process-time"):
+            if _h in response.headers:
+                del response.headers[_h]
+        # 不覆盖 nginx 层已设置的安全头（nginx 层更权威）；
+        # 但对直连后端（开发模式）确保基础安全头存在
+        if "x-content-type-options" not in response.headers:
+            response.headers["x-content-type-options"] = "nosniff"
+        if "x-frame-options" not in response.headers:
+            response.headers["x-frame-options"] = "DENY"
+        if "referrer-policy" not in response.headers:
+            response.headers["referrer-policy"] = "strict-origin-when-cross-origin"
+        return response
 
     # 请求追踪中间件（auth 中间件由插件 bootstrap 注册）
     setup_trace_middleware(app)
@@ -286,24 +409,104 @@ def create_app() -> FastAPI:
             content=exc.to_dict(),
         )
 
+    # [安全加固] 自定义 HTTP 异常响应格式，消除 FastAPI/Starlette 默认指纹
+    # 默认 404 返回 {"detail":"Not Found"}，是框架最强指纹之一
+    # 保留 exc.detail 作为用户可见的错误消息，避免覆盖路由中设置的具体信息
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):  # type: ignore[unused-argument]
+        import json as _json
+
+        _code_map = {
+            400: ("BAD_REQUEST", "请求错误"),
+            401: ("UNAUTHENTICATED", "未认证，请先登录"),
+            403: ("ACCESS_DENIED", "访问被拒绝"),
+            404: ("NOT_FOUND", "资源不存在"),
+            405: ("METHOD_NOT_ALLOWED", "请求方法不允许"),
+            409: ("CONFLICT", "资源状态冲突"),
+            413: ("PAYLOAD_TOO_LARGE", "请求体过大"),
+            429: ("RATE_LIMITED", "请求过于频繁"),
+        }
+
+        # 从 exc.detail 提取用户可见消息
+        detail = exc.detail
+        if isinstance(detail, str):
+            message = detail
+        elif isinstance(detail, (dict, list)):
+            message = _json.dumps(detail, ensure_ascii=False)
+        else:
+            message = str(detail) if detail else ""
+
+        # 如果 detail 为空（None/空字符串），使用默认消息
+        default_code, default_msg = _code_map.get(exc.status_code, ("HTTP_ERROR", f"HTTP {exc.status_code}"))
+        code = default_code
+        if not message:
+            message = default_msg
+
+        # 提取 details（如果 detail 是 dict）
+        details: dict[str, Any] = {}
+        if isinstance(detail, dict):
+            details = detail
+
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": {"code": code, "message": message, "details": details}},
+        )
+
+    # [安全加固] 自定义 422 响应格式，消除 FastAPI 默认校验错误指纹
+    # 默认 422 返回 {"detail":[{...}]}，是 FastAPI 框架最强指纹
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):  # type: ignore[unused-argument]
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "VALIDATION_ERROR",
+                    "message": "请求参数验证失败",
+                    "details": {"errors": exc.errors()},
+                }
+            },
+        )
+
     # 挂载业务路由（auth 路由由插件注册）
     app.include_router(agent_roles_router.router)
     app.include_router(captcha_router.router)
     app.include_router(meetings_router.router)
+    # ADR-017 Phase 1：产物查询 API（列表/单条/血缘）
+    app.include_router(artifacts_router.router)
+    # ADR-017 Phase 2：项目与议题池（/api/projects、/api/issues）
+    app.include_router(projects_router.router)
+    app.include_router(issues_router.router)
     app.include_router(documents_router.router)
+    app.include_router(code_router.router)
     app.include_router(metrics_router.router)
     app.include_router(workspace_router.router)
     app.include_router(ws_router.router)
     app.include_router(regression_router.router)
+    app.include_router(system_router.router)
     app.include_router(net_auth_router.router)
     app.include_router(preferences_router.router)
     app.include_router(audit_router.router)
     app.include_router(docker_hosts_router.router)
+    app.include_router(graph_router.router)
+    app.include_router(notifications_router.router)
+    app.include_router(teams_router.router)
+    app.include_router(config_router.router)
+    app.include_router(admin_router.router)
 
     @app.get("/health", tags=["meta"])
-    async def health() -> dict[str, Any]:
-        """健康检查：检查关键依赖可用性"""
+    async def health(request: Request, detail: str = "0") -> dict[str, Any]:
+        """健康检查：检查关键依赖可用性。
+
+        [安全加固] 默认 detail=0（最小响应），仅返回 {"status": "ok"}，不暴露内部架构信息；
+        detail=1（内网）返回完整 checks 详情。nginx 层根据来源 IP 自动注入 detail=1。
+        直连后端 8000 端口时默认安全，不泄露 PG/Redis/Qdrant 等依赖状态。
+        """
         from app.config import settings
+
+        # 外网最小响应模式：不执行依赖检查，仅返回存活状态
+        # 这避免了通过 health 端点探测内部服务架构（PG/Redis/Qdrant/Docker/LLM）
+        if detail == "0":
+            return {"status": "ok"}
 
         checks: dict[str, str] = {}
         _test_mode = os.environ.get("CONCLAVE_TEST_MODE") == "1"
@@ -373,22 +576,6 @@ def create_app() -> FastAPI:
         _healthy_vals = {"ok", "closed", "half_open", "disabled"}
         all_ok = all(v in _healthy_vals for v in checks.values())
         return {"status": "ok" if all_ok else "degraded", "checks": checks}
-
-    @app.on_event("shutdown")
-    async def _shutdown_event() -> None:
-        """应用关闭时清理资源"""
-        try:
-            from app.tools.playwright_search import close_playwright_search
-
-            await close_playwright_search()
-        except Exception:
-            pass
-        try:
-            from app.tools.browser_tool import close_browser_tool
-
-            await close_browser_tool()
-        except Exception:
-            pass
 
     _app_env = os.environ.get("APP_ENV", "dev").lower()
     if _app_env != "production":

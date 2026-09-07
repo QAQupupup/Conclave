@@ -23,6 +23,7 @@ from app.auth import (
     create_refresh_token,
     verify_jwt,
 )
+from app.config import settings
 from app.context import (
     get_user_id,
     get_user_role,
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["认证"])
 
 # Cookie 配置
-COOKIE_SECURE = False  # TODO: 生产环境从 settings 读取（HTTPS 时为 True）
+COOKIE_SECURE: bool = settings.cookie_secure
 COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
 COOKIE_PATH = "/"
 
@@ -197,13 +198,13 @@ async def login(req: LoginRequest, request: Request, response: Response) -> Logi
 
         t = await _get_tenant(int(login_tenant_id))
         if t:
-            tenant_info = {"id": t.id, "name": t.name, "slug": t.slug, "plan": t.plan}
+            tenant_info = {"id": str(t.id), "name": t.name, "slug": t.slug, "plan": t.plan}
         tenants = await list_user_tenants(int(user_id))
         from app.plugins.builtin.auth.tenants_router import ROLE_MEMBER, ROLE_OWNER
 
         tenant_list = [
             {
-                "id": tt.id,
+                "id": str(tt.id),
                 "name": tt.name,
                 "slug": tt.slug,
                 "role": ROLE_OWNER if tt.owner_id == int(user_id) else ROLE_MEMBER,
@@ -230,11 +231,11 @@ async def login(req: LoginRequest, request: Request, response: Response) -> Logi
         refresh_token=refresh_token,
         expires_in=JWT_EXPIRE_SECONDS,
         user={
-            "id": user_id,
+            "id": str(user_id),
             "username": username,
             "role": role,
             "display_name": user.get("display_name", username),
-            "tenant_id": login_tenant_id,
+            "tenant_id": str(login_tenant_id) if login_tenant_id is not None else None,
             "tenant": tenant_info,
             "tenants": tenant_list,
         },
@@ -377,7 +378,7 @@ async def me(request: Request) -> MeResponse:
         t = await get_tenant(tenant_id)
         if t:
             tenant_info = {
-                "id": t.id,
+                "id": str(t.id),
                 "name": t.name,
                 "slug": t.slug,
                 "plan": t.plan,
@@ -391,17 +392,23 @@ async def me(request: Request) -> MeResponse:
     from app.plugins.builtin.auth.tenants_router import ROLE_OWNER as _RO
 
     tenant_list = [
-        {"id": t.id, "name": t.name, "slug": t.slug, "role": _RO if t.owner_id == int(user_id) else _RM, "plan": t.plan}
+        {
+            "id": str(t.id),
+            "name": t.name,
+            "slug": t.slug,
+            "role": _RO if t.owner_id == int(user_id) else _RM,
+            "plan": t.plan,
+        }
         for t in tenants
     ]
 
     return MeResponse(
         user={
-            "id": user_id,
+            "id": str(user_id),
             "username": username,
             "role": role or user.get("role", "user"),
             "display_name": user.get("display_name", username),
-            "tenant_id": tenant_id,
+            "tenant_id": str(tenant_id) if tenant_id is not None else None,
             "tenant": tenant_info,
             "tenants": tenant_list,
         }

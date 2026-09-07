@@ -101,6 +101,19 @@ class Settings:
         str(Path.home() / ".conclave" / "workspace"),
     )
 
+    # 录制回放存储配置（操作截图落盘，避免大 base64 字段进 events/PostgreSQL）
+    # - recording_enabled：是否启用截图落盘；关闭时退回有界内联 base64
+    # - recording_dir：录制文件根目录（按 meeting_id 分子目录）
+    # - recording_retention_days：录制文件保留天数，<=0 表示不自动清理
+    # - recording_max_screenshot_bytes：单张截图落盘上限，超出退回内联 base64
+    recording_enabled: bool = _env("CONCLAVE_RECORDING_ENABLED", "1") == "1"
+    recording_dir: str = _env(
+        "CONCLAVE_RECORDING_DIR",
+        str(Path.home() / ".conclave" / "recordings"),
+    )
+    recording_retention_days: int = int(_env("CONCLAVE_RECORDING_RETENTION_DAYS", "7"))
+    recording_max_screenshot_bytes: int = int(_env("CONCLAVE_RECORDING_MAX_SCREENSHOT_BYTES", str(1024 * 1024)))
+
     # 三层记忆开关：CONCLAVE_MEMORY_DISABLED 环境变量存在（非空）时禁用
     memory_enabled: bool = _env("CONCLAVE_MEMORY_DISABLED", "") == ""
 
@@ -114,6 +127,14 @@ class Settings:
     web_search_mode: str = _env("CONCLAVE_WEB_SEARCH_MODE", "playwright")
     # Tavily API key（仅 tavily 模式需要）
     web_search_api_key: str = _env("CONCLAVE_WEB_SEARCH_API_KEY", "")
+
+    # Cookie 安全配置：HTTPS 环境下必须为 True
+    # 默认规则：APP_ENV=production 时为 True，其余环境（dev/test/oss）为 False
+    # 可通过 CONCLAVE_COOKIE_SECURE=1/0 显式覆盖
+    cookie_secure: bool = _env(
+        "CONCLAVE_COOKIE_SECURE",
+        "1" if os.environ.get("APP_ENV", "") == "production" else "0",
+    ) not in ("0", "false", "False", "")
 
     @property
     def use_real_llm(self) -> bool:
