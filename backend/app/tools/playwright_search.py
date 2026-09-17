@@ -39,12 +39,11 @@ from .domain_registry import (
     rank_by_tier,
     tag_url,
 )
-from .playwright.captcha_js import _CAPTCHA_DETECT_JS
+from .playwright import _CAPTCHA_DETECT_JS, _STEALTH_JS  # 开源版为空字符串
 from .playwright.chunk_js import _CHUNK_EXTRACT_JS
 from .playwright.jsonld_js import _JSONLD_EXTRACT_JS
-from .playwright.security import _is_safe_url
+from .playwright.security import _is_safe_url_async
 from .playwright.session_pool import SessionPool
-from .playwright.stealth_js import _STEALTH_JS
 
 logger = logging.getLogger("app.tools.playwright_search")
 
@@ -260,7 +259,8 @@ class PlaywrightWebSearch:
                 has_touch=False,
                 is_mobile=False,
             )
-            await context.add_init_script(_STEALTH_JS)
+            if _STEALTH_JS:
+                await context.add_init_script(_STEALTH_JS)
 
             try:
                 page = await context.new_page()
@@ -488,8 +488,8 @@ class PlaywrightWebSearch:
 
         fetched_at = datetime.now(timezone.utc).isoformat()
 
-        # SSRF 校验
-        safe, reason = _is_safe_url(url)
+        # SSRF 校验（异步版：含 DNS 解析校验，防 DNS rebinding 初始检查）
+        safe, reason = await _is_safe_url_async(url)
         if not safe:
             logger.warning("fetch_url SSRF拦截: url=%s reason=%s", url[:80], reason)
             return {
@@ -913,14 +913,15 @@ class PlaywrightWebSearch:
                 # Step 3: 等待结果页加载
                 await page.wait_for_timeout(4000)
 
-                # Step 3.25: 检测 Bing 验证码
-                try:
-                    captcha_result = await page.evaluate(_CAPTCHA_DETECT_JS)
-                    if captcha_result and captcha_result.get("detected"):
-                        logger.warning("Bing 搜索遇到 CAPTCHA: types=%s", captcha_result.get("types"))
-                        return []  # Bing 被验证码拦截，返回空，让 failover 到 DDG
-                except Exception:
-                    pass
+                # Step 3.25: 检测 Bing 验证码（开源版无检测脚本时跳过）
+                if _CAPTCHA_DETECT_JS:
+                    try:
+                        captcha_result = await page.evaluate(_CAPTCHA_DETECT_JS)
+                        if captcha_result and captcha_result.get("detected"):
+                            logger.warning("Bing 搜索遇到 CAPTCHA: types=%s", captcha_result.get("types"))
+                            return []  # Bing 被验证码拦截，返回空，让 failover 到 DDG
+                    except Exception:
+                        pass
 
                 # Step 3.5: 如果需要时间过滤，导航到带过滤参数的 URL
                 if time_range and time_range in _BING_TIME_FILTERS:
@@ -1041,8 +1042,8 @@ class PlaywrightWebSearch:
 
         异常处理：所有 Playwright 异常被捕获，返回空 chunks。
         """
-        # P0-1: SSRF 初始 URL 校验
-        safe, reason = _is_safe_url(url)
+        # P0-1: SSRF 初始 URL 校验（异步版：含 DNS 解析校验）
+        safe, reason = await _is_safe_url_async(url)
         if not safe:
             logger.warning("SSRF 拦截: url=%s reason=%s", url[:80], reason)
             return {
@@ -1139,10 +1140,10 @@ class PlaywrightWebSearch:
                 # goto 返回 Response 对象，含 HTTP 头
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
 
-                # P0-1: redirect-hop SSRF 验证
+                # P0-1: redirect-hop SSRF 验证（异步版：含 DNS 解析校验）
                 if response:
                     final_url = response.url
-                    safe_redirect, redirect_reason = _is_safe_url(final_url)
+                    safe_redirect, redirect_reason = await _is_safe_url_async(final_url)
                     if not safe_redirect:
                         logger.warning(
                             "SSRF redirect 拦截: initial=%s final=%s reason=%s",
@@ -1181,41 +1182,53 @@ class PlaywrightWebSearch:
                 # 拟人化等待：随机延迟 500-1500ms（模拟人类阅读页面开始加载）
                 await page.wait_for_timeout(500 + int(500 * (hash(url) % 100) / 100))
 
-                # ===== CAPTCHA 快速检测（在等待完整内容前先检测）=====
-                try:
-                    captcha_result = await page.evaluate(_CAPTCHA_DETECT_JS)
-                    if captcha_result and captcha_result.get("detected"):
-                        captcha_types = captcha_result.get("types", [])
-                        captcha_title = captcha_result.get("title", "")
-                        logger.warning(
-                            "CAPTCHA 检测: url=%s types=%s title=%s", url[:60], captcha_types, captcha_title[:50]
-                        )
-                        # 记录被拦截的域名
-                        if hostname_check:
-                            self._captcha_blocked_domains[hostname_check] = now
-
-                        # 值守模式：暂停等待人工介入
-                        try:
-                            from app.tools.captcha_guard import (
-                                CaptchaStatus,
-                                get_captcha_guard,
+                # ===== CAPTCHA 快速检测（开源版无检测脚本时跳过）=====
+                if _CAPTCHA_DETECT_JS:
+                    try:
+                        captcha_result = await page.evaluate(_CAPTCHA_DETECT_JS)
+                        if captcha_result and captcha_result.get("detected"):
+                            captcha_types = captcha_result.get("types", [])
+                            captcha_title = captcha_result.get("title", "")
+                            logger.warning(
+                                "CAPTCHA 检测: url=%s types=%s title=%s", url[:60], captcha_types, captcha_title[:50]
                             )
+                            # 记录被拦截的域名
+                            if hostname_check:
+                                self._captcha_blocked_domains[hostname_check] = now
 
-                            guard = await get_captcha_guard()
-                            if guard.guard_mode:
-                                status = await guard.intercept_captcha(
-                                    page=page,
-                                    url=url,
-                                    captcha_types=captcha_types,
-                                    page_title=captcha_title,
+                            # 值守模式：暂停等待人工介入
+                            try:
+                                from app.tools.captcha_guard import (
+                                    CaptchaStatus,
+                                    get_captcha_guard,
                                 )
-                                if status == CaptchaStatus.RESOLVED:
-                                    await page.wait_for_timeout(2000)
-                                    recheck = await page.evaluate(_CAPTCHA_DETECT_JS)
-                                    if recheck and recheck.get("detected"):
-                                        logger.warning("CAPTCHA 人工处理后仍然存在，跳过: %s", recheck.get("types"))
+
+                                guard = await get_captcha_guard()
+                                if guard.guard_mode:
+                                    status = await guard.intercept_captcha(
+                                        page=page,
+                                        url=url,
+                                        captcha_types=captcha_types,
+                                        page_title=captcha_title,
+                                    )
+                                    if status == CaptchaStatus.RESOLVED:
+                                        await page.wait_for_timeout(2000)
+                                        recheck = await page.evaluate(_CAPTCHA_DETECT_JS)
+                                        if recheck and recheck.get("detected"):
+                                            logger.warning("CAPTCHA 人工处理后仍然存在，跳过: %s", recheck.get("types"))
+                                        else:
+                                            pass  # CAPTCHA 已通过，继续正常提取流程
                                     else:
-                                        pass  # CAPTCHA 已通过，继续正常提取流程
+                                        return {
+                                            "chunks": [],
+                                            "title": captcha_title,
+                                            "jsonld": {"entry_count": 0},
+                                            "last_modified": None,
+                                            "fallback": True,
+                                            "ugc_count": 0,
+                                            "captcha": True,
+                                            "captcha_types": captcha_types,
+                                        }
                                 else:
                                     return {
                                         "chunks": [],
@@ -1227,7 +1240,7 @@ class PlaywrightWebSearch:
                                         "captcha": True,
                                         "captcha_types": captcha_types,
                                     }
-                            else:
+                            except ImportError:
                                 return {
                                     "chunks": [],
                                     "title": captcha_title,
@@ -1238,19 +1251,8 @@ class PlaywrightWebSearch:
                                     "captcha": True,
                                     "captcha_types": captcha_types,
                                 }
-                        except ImportError:
-                            return {
-                                "chunks": [],
-                                "title": captcha_title,
-                                "jsonld": {"entry_count": 0},
-                                "last_modified": None,
-                                "fallback": True,
-                                "ugc_count": 0,
-                                "captcha": True,
-                                "captcha_types": captcha_types,
-                            }
-                except Exception:
-                    pass  # CAPTCHA 检测本身不应该阻断流程
+                    except Exception:
+                        pass  # CAPTCHA 检测本身不应该阻断流程
 
                 # 拟人化：模拟页面滚动
                 try:

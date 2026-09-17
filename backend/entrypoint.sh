@@ -116,7 +116,9 @@ if [ "$DOCKER_READY" = "1" ]; then
         else
             echo "[entrypoint] Building data-science sandbox image (pandas/numpy/matplotlib/sklearn...)..."
             DS_CONTEXT=$(dirname "$DATASCIENCE_DOCKERFILE")
-            if su -s /bin/bash "$APP_USER" -c "docker build -t '$DATASCIENCE_IMAGE' -f '$DATASCIENCE_DOCKERFILE' '$DS_CONTEXT'" 2>&1 | tail -50; then
+            # [修复] 传入标准沙箱镜像作为构建参数，确保 FROM 使用已缓存的本地镜像
+            # 避免数据科学 Dockerfile 独立拉取基础镜像失败
+            if su -s /bin/bash "$APP_USER" -c "docker build --build-arg SANDBOX_IMAGE='$SANDBOX_IMAGE' -t '$DATASCIENCE_IMAGE' -f '$DATASCIENCE_DOCKERFILE' '$DS_CONTEXT'" 2>&1 | tail -50; then
                 echo "[entrypoint] Data-science image built successfully"
             else
                 echo "[entrypoint] WARNING: Failed to build data-science image; analysis features will use standard image"
@@ -130,5 +132,17 @@ fi
 # ---- 4. 最终权限确认 ----
 chown -R "$APP_UID:$APP_GID" /workspace /app/data 2>/dev/null || true
 
+echo "[entrypoint] Applying database migrations (alembic upgrade head)..."
+# ADR-019: 建表单一真相收敛为 Alembic。启动 uvicorn 之前执行 alembic upgrade head，
+# 创建/升级所有 ORM 表 + 原生表，替代原先后端进程内的 Base.metadata.create_all()。
+# 迁移失败直接终止启动（fail-fast），避免以残缺 schema 运行。
+if su -s /bin/bash "$APP_USER" -c "cd /app && alembic upgrade head"; then
+    echo "[entrypoint] Database migrations applied successfully"
+else
+    echo "[entrypoint] ERROR: alembic upgrade head failed - aborting startup" >&2
+    exit 1
+fi
+
 echo "[entrypoint] Starting uvicorn as $APP_USER (uid=$APP_UID)..."
-exec su -s /bin/bash "$APP_USER" -c "cd /app && exec python -m uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --loop uvloop"
+# [安全加固] --no-server-header 隐藏 uvicorn 版本标识，避免指纹识别
+exec su -s /bin/bash "$APP_USER" -c "cd /app && exec python -m uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --loop uvloop --no-server-header"

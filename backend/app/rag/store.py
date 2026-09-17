@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import math
 import os
@@ -10,7 +11,10 @@ from typing import Any, Protocol
 import httpx
 
 from app.config import settings
+from app.logging_config import get_logger
 from app.rag.chunker import Chunk
+
+logger = get_logger("rag.store")
 
 
 class Embedding(Protocol):
@@ -83,13 +87,31 @@ class SiliconFlowEmbedding:
         assert self._client is not None
         return self._client
 
-    def _resolve_config(self) -> tuple[str, str, str]:
-        """解析当前生效的 (base_url, api_key, model)。"""
+    def resolve_config(self) -> tuple[str, str, str]:
+        """解析当前生效的 (base_url, api_key, model)。
+
+        优先级：租户级覆盖 > 系统配置(DB) > 全局默认（环境变量）
+        """
+        # 系统配置层（admin 通过 UI 配置，优先于环境变量默认）
+        sys_base, sys_key, sys_model = self._base_url, self._api_key, self._model
+        try:
+            from app.services.config_service import get_cached_system_settings
+
+            sys_cfg = get_cached_system_settings()
+            if sys_cfg.get("embed_api_key"):
+                sys_key = sys_cfg["embed_api_key"]
+            if sys_cfg.get("embed_base_url"):
+                sys_base = sys_cfg["embed_base_url"]
+            if sys_cfg.get("embed_model"):
+                sys_model = sys_cfg["embed_model"]
+        except Exception:
+            pass
+
         from app.tenants.context import get_tenant_id
         from app.tenants.settings_override import resolve_embed_config
 
         tid = get_tenant_id()
-        return resolve_embed_config(tid, self._base_url, self._api_key, self._model)
+        return resolve_embed_config(tid, sys_base, sys_key, sys_model)
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -104,7 +126,7 @@ class SiliconFlowEmbedding:
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        base_url, api_key, model = self._resolve_config()
+        base_url, api_key, model = self.resolve_config()
         if not base_url or not api_key:
             # 没有配置 key，降级到 stub
             return await StubEmbedding(dim=self.dim).embed_batch(texts)
@@ -114,16 +136,36 @@ class SiliconFlowEmbedding:
         all_vecs: list[list[float]] = []
         for i in range(0, len(texts), 32):
             batch = texts[i : i + 32]
-            resp = await client.post(
-                f"{base_url}/embeddings",
-                json={"model": model, "input": batch},
-                headers=headers,
-            )
-            resp.raise_for_status()
-            data = resp.json()["data"]
-            # 按 index 排序确保顺序正确
-            data.sort(key=lambda x: x["index"])
-            all_vecs.extend([item["embedding"] for item in data])
+            # 重试机制：DNS 间歇性失败时自动重试 3 次（间隔 1s/2s/4s）
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    resp = await client.post(
+                        f"{base_url}/embeddings",
+                        json={"model": model, "input": batch},
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()["data"]
+                    # 按 index 排序确保顺序正确
+                    data.sort(key=lambda x: x["index"])
+                    all_vecs.extend([item["embedding"] for item in data])
+                    last_exc = None
+                    break  # 成功则跳出重试循环
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
+                    last_exc = e
+                    if attempt < 2:
+                        wait = 2**attempt
+                        logger.warning(
+                            "Embedding API 连接失败 (attempt %d/3), %ds 后重试: %s",
+                            attempt + 1,
+                            wait,
+                            str(e)[:100],
+                        )
+                        await asyncio.sleep(wait)
+            if last_exc is not None:
+                # 重试 3 次仍失败，抛出明确异常
+                raise RuntimeError(f"Embedding API 不可用（重试 3 次失败）: {last_exc}") from last_exc
         return all_vecs
 
 
@@ -213,11 +255,30 @@ class SiliconFlowReranker:
         return self._client
 
     def _resolve_config(self) -> tuple[str, str, str]:
+        """解析当前生效的 (base_url, api_key, model)。
+
+        优先级：租户级覆盖 > 系统配置(DB) > 全局默认（环境变量）
+        """
+        # 系统配置层（admin 通过 UI 配置，优先于环境变量默认）
+        sys_base, sys_key, sys_model = self._base_url, self._api_key, self._model
+        try:
+            from app.services.config_service import get_cached_system_settings
+
+            sys_cfg = get_cached_system_settings()
+            if sys_cfg.get("rerank_api_key"):
+                sys_key = sys_cfg["rerank_api_key"]
+            if sys_cfg.get("rerank_base_url"):
+                sys_base = sys_cfg["rerank_base_url"]
+            if sys_cfg.get("rerank_model"):
+                sys_model = sys_cfg["rerank_model"]
+        except Exception:
+            pass
+
         from app.tenants.context import get_tenant_id
         from app.tenants.settings_override import resolve_rerank_config
 
         tid = get_tenant_id()
-        return resolve_rerank_config(tid, self._base_url, self._api_key, self._model)
+        return resolve_rerank_config(tid, sys_base, sys_key, sys_model)
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -253,9 +314,7 @@ class SiliconFlowReranker:
             results = data.get("results", [])
             return [(r["index"], float(r.get("relevance_score", 0.0))) for r in results]
         except Exception as e:
-            import logging
-
-            logging.getLogger("app.rag.store").warning(
+            logger.warning(
                 "Reranker API 调用失败，回退关键词重排序: %s: %s",
                 type(e).__name__,
                 str(e)[:200],
@@ -324,16 +383,25 @@ class InMemoryVectorStore:
     支持原文缓存和惰性展开：存文档原文，按 char_range 按需展开上下文。
     """
 
-    def __init__(self, embedding: Embedding | None = None) -> None:
+    def __init__(self, embedding: Embedding | None = None, meeting_id: str = "") -> None:
         self._embedding = embedding or _build_embedding()
         self._store: dict[str, tuple[Chunk, list[float]]] = {}
         # 原文缓存：doc_id → 原始文本，用于惰性展开
         self._raw_texts: dict[str, str] = {}
+        # 会议作用域：写入时给 chunk 盖章，Qdrant 检索时作为过滤条件
+        self._meeting_id = meeting_id
 
     async def add_chunks(self, chunks: list[Chunk]) -> None:
         """切块入库并计算向量（批量嵌入提升效率）"""
         if not chunks:
             return
+        # [Wave 1] 注入租户 ID（用于 Qdrant payload 过滤和内存关键词检索过滤）
+        from app.tenants.context import get_tenant_id
+
+        _tid = get_tenant_id()
+        for chunk in chunks:
+            chunk.tenant_id = _tid
+            chunk.meeting_id = self._meeting_id
         texts = [c.text for c in chunks]
         vecs = await self._embedding.embed_batch(texts)
         for chunk, vec in zip(chunks, vecs, strict=False):
@@ -422,19 +490,35 @@ class InMemoryVectorStore:
 
         RRF（Reciprocal Rank Fusion）：score = 1/(K + rank)
         两路各取 top_k*2 个候选，RRF 融合后截取 top_k。
+
+        [Wave 1] 多租户隔离：仅检索当前租户的 chunk，系统租户可检索全部。
         """
         if not self._store:
             return []
 
+        # [Wave 1] 租户过滤：仅检索当前租户的数据
+        from app.tenants.context import get_tenant_id, is_system_tenant
+
+        if is_system_tenant():
+            visible_chunks = list(self._store.values())
+        else:
+            _tid = get_tenant_id()
+            if _tid is None:
+                # fail-closed：未设置租户上下文时返回空，防止数据泄露
+                return []
+            visible_chunks = [(chunk, vec) for chunk, vec in self._store.values() if chunk.tenant_id == _tid]
+            if not visible_chunks:
+                return []
+
         # 1. 向量检索
         qvec = await self._embedding.embed(query)
-        vec_scored = [(chunk, cosine_similarity(qvec, vec)) for chunk, vec in self._store.values()]
+        vec_scored = [(chunk, cosine_similarity(qvec, vec)) for chunk, vec in visible_chunks]
         vec_scored.sort(key=lambda x: x[1], reverse=True)
         vec_candidates = vec_scored[: top_k * 2]
 
         # 2. 关键词检索（TF-IDF 简化版）
         query_terms = _tokenize_query(query)
-        kw_scored = [(chunk, _keyword_score(chunk.text, query_terms)) for chunk, _ in self._store.values()]
+        kw_scored = [(chunk, _keyword_score(chunk.text, query_terms)) for chunk, _ in visible_chunks]
         kw_scored.sort(key=lambda x: x[1], reverse=True)
         kw_candidates = kw_scored[: top_k * 2]
 
@@ -475,12 +559,22 @@ class QdrantVectorStore(InMemoryVectorStore):
     Qdrant 不可用时自动降级到内存（_build_store 已处理）。
     """
 
-    def __init__(self, url: str, embedding: Embedding | None = None) -> None:
-        super().__init__(embedding)
+    def __init__(self, url: str, embedding: Embedding | None = None, meeting_id: str = "") -> None:
+        super().__init__(embedding, meeting_id=meeting_id)
         self._url = url.rstrip("/")
         self._collection = os.environ.get("CONCLAVE_QDRANT_COLLECTION", "conclave_chunks")
         self._client = None
         self._initialized = False
+
+    @staticmethod
+    def _point_id(chunk_id: str) -> int:
+        """确定性点 ID：sha256(chunk_id) 前 8 字节转 int63。
+
+        旧实现用内置 hash()，Python 字符串 hash 按进程随机加盐（PYTHONHASHSEED），
+        重启后同一 chunk 生成不同点 ID，Qdrant 中会累积重复点。
+        """
+        digest = hashlib.sha256(chunk_id.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big") & (2**63 - 1)
 
     def _get_client(self):
         if self._client is None:
@@ -502,7 +596,7 @@ class QdrantVectorStore(InMemoryVectorStore):
 
     async def ensure_collection(self) -> None:
         """确保 collection 存在，不存在则创建"""
-        from qdrant_client.models import Distance, VectorParams
+        from qdrant_client.models import Distance, PayloadSchemaType, VectorParams
 
         client = self._get_client()
         collections = client.get_collections().collections
@@ -514,6 +608,21 @@ class QdrantVectorStore(InMemoryVectorStore):
                 collection_name=self._collection,
                 vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
             )
+        # [Wave 1] 为 tenant_id 创建 payload index，加速检索过滤
+        with contextlib.suppress(Exception):
+            # index 可能已存在，忽略
+            client.create_payload_index(
+                collection_name=self._collection,
+                field_name="tenant_id",
+                field_schema=PayloadSchemaType.INTEGER,
+            )
+        # meeting_id 过滤索引（会议作用域隔离）
+        with contextlib.suppress(Exception):
+            client.create_payload_index(
+                collection_name=self._collection,
+                field_name="meeting_id",
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
 
     async def add_chunks(self, chunks: list[Chunk]) -> None:
         """入库：计算向量 + 写 Qdrant"""
@@ -522,6 +631,13 @@ class QdrantVectorStore(InMemoryVectorStore):
         await self._ensure_initialized()
         from qdrant_client.models import PointStruct
 
+        # [Wave 1] 注入租户 ID 到 chunk，写入 Qdrant payload 用于检索过滤
+        from app.tenants.context import get_tenant_id
+
+        _tid = get_tenant_id()
+        for chunk in chunks:
+            chunk.tenant_id = _tid
+            chunk.meeting_id = self._meeting_id
         texts = [c.text for c in chunks]
         vecs = await self._embedding.embed_batch(texts)
         client = self._get_client()
@@ -534,7 +650,7 @@ class QdrantVectorStore(InMemoryVectorStore):
             # Qdrant 存 payload
             points.append(
                 PointStruct(
-                    id=hash(chunk.chunk_id) % (2**63),
+                    id=self._point_id(chunk.chunk_id),
                     vector=vec,
                     payload=chunk.to_dict(),
                 )
@@ -545,16 +661,58 @@ class QdrantVectorStore(InMemoryVectorStore):
         """混合检索：Qdrant 向量检索 + 内存关键词检索 → RRF 融合
 
         失败时回退到父类 hybrid_search（纯内存混合检索）。
+
+        [Wave 1] 多租户隔离：向量检索加 tenant_id payload 过滤，
+        关键词检索仅遍历当前租户的内存 chunk。
         """
         try:
             await self._ensure_initialized()
             client = self._get_client()
             qvec = await self._embedding.embed(query)
 
+            # [Wave 1] 构建租户过滤条件
+            from qdrant_client.models import Condition, FieldCondition, Filter, MatchValue
+
+            from app.tenants.context import get_tenant_id, is_system_tenant
+
+            if is_system_tenant():
+                # 系统租户跨租户可见，但仍限本会议作用域（共享 collection）
+                if self._meeting_id:
+                    query_filter = Filter(
+                        must=[
+                            FieldCondition(
+                                key="meeting_id",
+                                match=MatchValue(value=self._meeting_id),
+                            )
+                        ]
+                    )
+                else:
+                    query_filter = None
+            else:
+                _tid = get_tenant_id()
+                # fail-closed：未设置租户上下文时用不可能匹配的值（-1）
+                tid_filter = _tid if _tid is not None else -1
+                must_conditions: list[Condition] = [
+                    FieldCondition(
+                        key="tenant_id",
+                        match=MatchValue(value=tid_filter),
+                    )
+                ]
+                # 会议作用域过滤：共享 collection 下防止跨会议串扰
+                if self._meeting_id:
+                    must_conditions.append(
+                        FieldCondition(
+                            key="meeting_id",
+                            match=MatchValue(value=self._meeting_id),
+                        )
+                    )
+                query_filter = Filter(must=must_conditions)
+
             # 1. Qdrant 向量检索
             results = client.search(
                 collection_name=self._collection,
                 query_vector=qvec,
+                query_filter=query_filter,
                 limit=top_k * 2,
             )
             vec_candidates: list[tuple[Chunk, float]] = []
@@ -570,14 +728,40 @@ class QdrantVectorStore(InMemoryVectorStore):
                     source=payload.get("source", ""),
                     prev_id=payload.get("prev_id", ""),
                     next_id=payload.get("next_id", ""),
+                    tenant_id=payload.get("tenant_id"),
+                    meeting_id=payload.get("meeting_id", ""),
                 )
                 vec_candidates.append((chunk, r.score or 0.0))
 
             # 2. 关键词检索（内存中计分）
+            # 注意：关键词检索遍历内存缓存 self._store，Qdrant 可能有更多 chunk
+            # 不在内存中（内存只缓存 add_chunks 时写入的 chunk）。
+            # 如果内存覆盖率不足，关键词召回会漏数据，日志会警告。
+            # [Wave 1] 关键词检索同样需要租户过滤
             query_terms = _tokenize_query(query)
-            kw_scored = [(chunk, _keyword_score(chunk.text, query_terms)) for chunk, _ in self._store.values()]
+            if is_system_tenant():
+                visible_mem = list(self._store.values())
+            elif _tid is not None:
+                visible_mem = [(c, v) for c, v in self._store.values() if c.tenant_id == _tid]
+            else:
+                visible_mem = []
+            mem_chunk_count = len(visible_mem)
+            kw_scored = [(chunk, _keyword_score(chunk.text, query_terms)) for chunk, _ in visible_mem]
             kw_scored.sort(key=lambda x: x[1], reverse=True)
             kw_candidates = kw_scored[: top_k * 2]
+
+            # 审计日志：关键词检索覆盖率
+            if mem_chunk_count == 0:
+                logger.warning(
+                    "Qdrant 混合检索: 内存缓存为空，关键词召回被跳过 （向量检索仍有效，但 RRF 融合退化为纯向量排序）"
+                )
+            elif len(vec_candidates) > mem_chunk_count:
+                # Qdrant 向量检索返回的候选数 > 内存缓存数，说明内存可能不全
+                logger.debug(
+                    "Qdrant 混合检索: 内存缓存=%d, 向量候选=%d, 关键词检索仅覆盖内存中的 chunk",
+                    mem_chunk_count,
+                    len(vec_candidates),
+                )
 
             # 3. RRF 融合
             rrf_k = 60
@@ -596,20 +780,41 @@ class QdrantVectorStore(InMemoryVectorStore):
             merged = sorted(chunk_ranks.values(), key=lambda x: x[1], reverse=True)
             return [(chunk, round(rrf_score, 4)) for chunk, rrf_score, _ in merged[:top_k]]
 
-        except Exception:
-            import logging
-
-            logging.getLogger("app.rag.store").warning(
-                "Qdrant 混合检索失败，回退内存混合检索（内存缓存: %d 条）",
+        except Exception as e:
+            logger.warning(
+                "Qdrant 混合检索失败，回退内存混合检索（内存缓存: %d 条）: %s: %s",
                 len(self._store),
+                type(e).__name__,
+                str(e)[:200],
             )
             return await super().search(query, top_k)
 
     def clear(self) -> None:
-        """清空：删 Qdrant collection + 内存"""
+        """清空本会议作用域的点 + 内存。
+
+        共享 collection 下禁止直接 delete_collection（会误删其他会议/租户的向量），
+        有 meeting_id 时按过滤条件删点；无 meeting_id（测试场景）才允许删整个 collection。
+        """
         try:
             client = self._get_client()
-            client.delete_collection(collection_name=self._collection)
+            if self._meeting_id:
+                from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
+
+                client.delete(
+                    collection_name=self._collection,
+                    points_selector=FilterSelector(
+                        filter=Filter(
+                            must=[
+                                FieldCondition(
+                                    key="meeting_id",
+                                    match=MatchValue(value=self._meeting_id),
+                                )
+                            ]
+                        )
+                    ),
+                )
+            else:
+                client.delete_collection(collection_name=self._collection)
         except Exception:
             pass
         self._store.clear()
@@ -622,10 +827,20 @@ class QdrantVectorStore(InMemoryVectorStore):
 # ---------------------------------------------------------------------------
 
 
+_stub_embed_warned = False
+
+
 def _build_embedding() -> Embedding:
     """按配置构建嵌入器：有 key 用真实 bge-m3，否则用 stub"""
+    global _stub_embed_warned
     if settings.use_real_embed:
         return SiliconFlowEmbedding()
+    if not _stub_embed_warned:
+        logger.warning(
+            "⚠️ Embedding 未配置 API Key，使用 StubEmbedding 返回伪向量。"
+            "配置 EMBEDDING_API_KEY 环境变量以使用真实嵌入模型。"
+        )
+        _stub_embed_warned = True
     return StubEmbedding()
 
 
@@ -640,7 +855,7 @@ def get_store(meeting_id: str) -> InMemoryVectorStore:
     已全部异步化，Qdrant collection 在首次 IO 时 lazy 初始化。
     """
     if meeting_id not in _stores:
-        _stores[meeting_id] = _build_store()
+        _stores[meeting_id] = _build_store(meeting_id)
     return _stores[meeting_id]
 
 
@@ -664,7 +879,7 @@ def clear_store(meeting_id: str) -> bool:
     return False
 
 
-def _build_store() -> InMemoryVectorStore:
+def _build_store(meeting_id: str = "") -> InMemoryVectorStore:
     """按配置构建向量库：优先 Qdrant，回退内存。
 
     注意：此处不再同步调用 ensure_collection（阻塞事件循环），
@@ -673,12 +888,12 @@ def _build_store() -> InMemoryVectorStore:
     qdrant_url = getattr(settings, "qdrant_url", "") or ""
     if qdrant_url:
         try:
-            store = QdrantVectorStore(url=qdrant_url, embedding=_build_embedding())
+            store = QdrantVectorStore(url=qdrant_url, embedding=_build_embedding(), meeting_id=meeting_id)
             # 不在同步构造阶段调用 ensure_collection，留给首次 async 操作 lazy init
             return store
         except Exception:
             pass  # Qdrant 不可用时回退内存
-    return InMemoryVectorStore(embedding=_build_embedding())
+    return InMemoryVectorStore(embedding=_build_embedding(), meeting_id=meeting_id)
 
 
 # Reranker 进程级单例

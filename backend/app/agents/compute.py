@@ -17,22 +17,33 @@ from app.agents.prompts import (
     ARBITRATE,
     ARCHITECT_INTRA,
     CROSS_TEAM,
+    DATA_ENGINEER_INTRA,
     ENGINEER_INTRA,
     EVIDENCE_CHECK,
+    MARKETING_EXPERT_INTRA,
     MODERATOR_CLARIFY,
+    MODERATOR_INTRA,
     PRODUCE,
+    SECURITY_EXPERT_INTRA,
+    UX_DESIGNER_INTRA,
     render,
 )
 from app.agents.role_templates import ROLE_LIBRARY
 from app.logging_config import get_logger
 from app.models import Role
 
+logger = get_logger("agents.compute")
+
 # IntraTeam 阶段的角色 → 模板注册表（Registry 模式）
-# 消除 build_intra_prompt / build_intra_react_prompt 中的 if/elif 硬编码分派
-# 新增角色只需在此注册，无需改业务逻辑（开闭原则）
+# ADR-014 Phase 1: 全 7 角色覆盖，消除"5 角色回退到架构师模板"问题
 _INTRA_TEAM_TEMPLATES: dict[Role, str] = {
     Role.ENGINEER: ENGINEER_INTRA,
     Role.PRODUCT_ARCHITECT: ARCHITECT_INTRA,
+    Role.SECURITY_EXPERT: SECURITY_EXPERT_INTRA,
+    Role.DATA_ENGINEER: DATA_ENGINEER_INTRA,
+    Role.UX_DESIGNER: UX_DESIGNER_INTRA,
+    Role.MARKETING_EXPERT: MARKETING_EXPERT_INTRA,
+    Role.MODERATOR: MODERATOR_INTRA,
 }
 
 # Role 枚举值 → ROLE_LIBRARY key 映射
@@ -43,6 +54,7 @@ _ROLE_KEY_MAP: dict[str, str] = {
     "security_expert": "security_expert",
     "data_engineer": "data_engineer",
     "ux_designer": "ux_designer",
+    "marketing_expert": "marketing_expert",
 }
 
 
@@ -111,6 +123,8 @@ class ThinkRequest:
     available_tools: list[dict[str, Any]] = field(default_factory=list)  # [{name, description, parameters}]
     tool_history: list[ToolResult] = field(default_factory=list)
     iteration: int = 0
+    # 流式回调：非 None 时启用 SSE 流式输出（仅 produce 等长等待阶段使用）
+    on_token: Any = None  # Callable[[str], Any] | None
 
 
 @dataclass
@@ -177,6 +191,7 @@ class LocalAgentCompute:
                 schema_hint=req.schema_hint,
                 model_override=req.model or "",
                 agent_role=req.agent_role or "",
+                on_token=req.on_token,
             )
 
             # ReAct 模式：从 result 中提取 tool_calls 和 need_continue
@@ -268,8 +283,9 @@ class GRPCAgentCompute:
 
             # 当前降级到本地
             return await self._fallback.think(req)
-        except Exception:
+        except Exception as e:
             # gRPC 调用失败，降级到本地
+            logger.debug("gRPC think 调用失败，降级到本地计算: %s", e)
             return await self._fallback.think(req)
 
     async def think_batch(self, requests: list[ThinkRequest]) -> list[ThinkResponse]:
@@ -277,7 +293,8 @@ class GRPCAgentCompute:
             # TODO: 使用 gRPC 双向流批量发送
             # 当前降级到本地并行
             return await self._fallback.think_batch(requests)
-        except Exception:
+        except Exception as e:
+            logger.debug("gRPC think_batch 调用失败，降级到本地计算: %s", e)
             return await self._fallback.think_batch(requests)
 
 
@@ -298,7 +315,8 @@ def _inject_profile(prompt: str, agent_role: str) -> str:
         from app.memory.profile import inject_profile
 
         return inject_profile(prompt, agent_role)
-    except Exception:
+    except Exception as e:
+        logger.debug("注入角色画像失败，返回原始 prompt: %s", e)
         return prompt
 
 
@@ -348,8 +366,8 @@ def _inject_skills(prompt: str, stage: str, deliverable_type: str = "", role: st
         )
         if skills_text:
             return f"{prompt}\n\n{skills_text}"
-    except Exception:
-        pass  # Skill加载失败不影响主流程
+    except Exception as e:
+        logger.debug("Skill 加载失败，不影响主流程: %s", e)
     return prompt
 
 
@@ -389,13 +407,29 @@ def build_clarify_prompt(
     )
 
 
-def build_intra_prompt(role: Role, clarified_topic: str, stance: str, anchor: str = "") -> ThinkRequest:
-    """构造 intra_team 阶段的思考请求"""
+def build_intra_prompt(
+    role: Role,
+    clarified_topic: str,
+    stance: str,
+    anchor: str = "",
+    available_tools: list[dict[str, Any]] | None = None,
+) -> ThinkRequest:
+    """构造 intra_team 阶段的思考请求
+
+    [Wave 7] clarified_topic 来自 LLM 产出（clarify 阶段），经过 sanitize_untrusted_content
+    清洗以防止注入模式传播到 intra_team 阶段。使用 strip_injection_patterns=True 移除
+    角色标记和指令劫持短语，但不加包裹标签（因为是模板变量，非原始用户输入）。
+    """
+    from app.orchestrator.prompt_safety import sanitize_untrusted_content
+
+    safe_topic = sanitize_untrusted_content(clarified_topic)
     template = _get_intra_template(role)
     persona = _get_role_persona(role.value)
-    prompt = render(template, role_persona=persona, clarified_topic=clarified_topic, stance=stance)
+    prompt = render(template, role_persona=persona, clarified_topic=safe_topic, stance=stance)
     prompt = _inject_profile(prompt, role.value)
     prompt = _inject_skills(prompt, stage="intra_team", role=role.value)
+    if available_tools:
+        prompt = _inject_tools_to_prompt(prompt, available_tools)
     if anchor:
         prompt = f"{anchor}\n\n{prompt}"
     return ThinkRequest(
@@ -403,6 +437,7 @@ def build_intra_prompt(role: Role, clarified_topic: str, stance: str, anchor: st
         stage="intra_team",
         prompt=prompt,
         schema_hint="intra_team",
+        available_tools=available_tools or [],
     )
 
 
@@ -419,7 +454,12 @@ def build_intra_react_prompt(
     让当前角色可以看到其他人的观点并做出反应，提升辩论质量。
 
     prior_conclusions: 前序角色的结论列表 [{"role": "...", "stance": "...", "claims": [...]}]
+
+    [Wave 7] clarified_topic 和 prior_conclusions 均来自 LLM 产出，经过清洗防止注入传播。
     """
+    from app.orchestrator.prompt_safety import sanitize_untrusted_content
+
+    safe_topic = sanitize_untrusted_content(clarified_topic)
     template = _get_intra_template(role)
     # 构造前序结论摘要
     prior_summary = ""
@@ -432,12 +472,10 @@ def build_intra_react_prompt(
         prior_summary = (
             "\n\n【前序发言参考】\n"
             "以下是其他角色已发表的论点，请在你的分析中参考并考虑是否认同或反驳：\n"
-            + "\n".join(parts)
+            + sanitize_untrusted_content("\n".join(parts))
             + "\n\n请基于上述参考，结合你的专业视角发表论点。"
         )
-    prompt = render(
-        template, role_persona=_get_role_persona(role.value), clarified_topic=clarified_topic, stance=stance
-    )
+    prompt = render(template, role_persona=_get_role_persona(role.value), clarified_topic=safe_topic, stance=stance)
     # 在模板渲染后注入前序结论
     if prior_summary:
         prompt = prompt + prior_summary
@@ -453,10 +491,20 @@ def build_intra_react_prompt(
     )
 
 
-def build_cross_team_prompt(team_conclusions: list[dict], anchor: str = "") -> ThinkRequest:
-    prompt = render(CROSS_TEAM, team_conclusions=str(team_conclusions))
+def build_cross_team_prompt(
+    team_conclusions: list[dict],
+    anchor: str = "",
+    available_tools: list[dict[str, Any]] | None = None,
+) -> ThinkRequest:
+    """[Wave 7] team_conclusions 来自 LLM 产出，经 sanitize_untrusted_content 清洗"""
+    from app.orchestrator.prompt_safety import sanitize_untrusted_content
+
+    safe_conclusions = sanitize_untrusted_content(str(team_conclusions))
+    prompt = render(CROSS_TEAM, team_conclusions=safe_conclusions)
     prompt = _inject_profile(prompt, Role.MODERATOR.value)
     prompt = _inject_skills(prompt, stage="cross_team", role=Role.MODERATOR.value)
+    if available_tools:
+        prompt = _inject_tools_to_prompt(prompt, available_tools)
     if anchor:
         prompt = f"{anchor}\n\n{prompt}"
     return ThinkRequest(
@@ -464,13 +512,20 @@ def build_cross_team_prompt(team_conclusions: list[dict], anchor: str = "") -> T
         stage="cross_team",
         prompt=prompt,
         schema_hint="cross_team",
+        available_tools=available_tools or [],
     )
 
 
 def build_evidence_prompt(
     conflict: dict, evidence_chunks: list[dict], anchor: str = "", available_tools: list[dict[str, Any]] | None = None
 ) -> ThinkRequest:
-    prompt = render(EVIDENCE_CHECK, conflict=str(conflict), evidence_chunks=str(evidence_chunks))
+    """[Wave 7] conflict 来自 LLM 产出，经 sanitize_untrusted_content 清洗。
+    evidence_chunks 已在 _collect_evidence 上游清洗，此处 defense-in-depth 再次清洗。"""
+    from app.orchestrator.prompt_safety import sanitize_untrusted_content
+
+    safe_conflict = sanitize_untrusted_content(str(conflict))
+    safe_chunks = str(evidence_chunks)  # 已在上游清洗
+    prompt = render(EVIDENCE_CHECK, conflict=safe_conflict, evidence_chunks=safe_chunks)
     prompt = _inject_profile(prompt, Role.MODERATOR.value)
     prompt = _inject_skills(prompt, stage="evidence_check", role=Role.MODERATOR.value)
     if available_tools:
@@ -486,10 +541,20 @@ def build_evidence_prompt(
     )
 
 
-def build_arbitrate_prompt(evidence_set: list[dict], anchor: str = "") -> ThinkRequest:
-    prompt = render(ARBITRATE, evidence_set=str(evidence_set))
+def build_arbitrate_prompt(
+    evidence_set: list[dict],
+    anchor: str = "",
+    available_tools: list[dict[str, Any]] | None = None,
+) -> ThinkRequest:
+    """[Wave 7] evidence_set 来自 LLM 产出，经 sanitize_untrusted_content 清洗"""
+    from app.orchestrator.prompt_safety import sanitize_untrusted_content
+
+    safe_evidence = sanitize_untrusted_content(str(evidence_set))
+    prompt = render(ARBITRATE, evidence_set=safe_evidence)
     prompt = _inject_profile(prompt, Role.MODERATOR.value)
     prompt = _inject_skills(prompt, stage="arbitrate", role=Role.MODERATOR.value)
+    if available_tools:
+        prompt = _inject_tools_to_prompt(prompt, available_tools)
     if anchor:
         prompt = f"{anchor}\n\n{prompt}"
     return ThinkRequest(
@@ -497,6 +562,7 @@ def build_arbitrate_prompt(evidence_set: list[dict], anchor: str = "") -> ThinkR
         stage="arbitrate",
         prompt=prompt,
         schema_hint="arbitrate",
+        available_tools=available_tools or [],
     )
 
 
@@ -506,6 +572,7 @@ def build_produce_prompt(
     template: str | None = None,
     deliverable_type: str = "prd_openapi",
     evidence_summary: dict | None = None,
+    available_tools: list[dict[str, Any]] | None = None,
 ) -> ThinkRequest:
     if template is None:
         template = PRODUCE
@@ -517,15 +584,21 @@ def build_produce_prompt(
     evidence_context = ""
     if evidence_summary and deliverable_type in ("data_science", "code_analysis", "tested_system"):
         evidence_context = _format_evidence_for_code_gen(evidence_summary)
+    # [Wave 7] decision_record 来自 LLM 产出（仲裁阶段），经清洗防止注入传播
+    from app.orchestrator.prompt_safety import sanitize_untrusted_content
+
+    safe_decision = sanitize_untrusted_content(str(decision_record))
     prompt = render(
         template,
-        decision_record=str(decision_record),
+        decision_record=safe_decision,
         bug_patterns=bug_patterns,
         evidence_context=evidence_context,
     )
     prompt = _inject_profile(prompt, Role.MODERATOR.value)
     # 注入匹配的Skills（UI设计规范、代码规范等，根据deliverable_type动态加载）
     prompt = _inject_skills(prompt, stage="produce", deliverable_type=deliverable_type, role=Role.MODERATOR.value)
+    if available_tools:
+        prompt = _inject_tools_to_prompt(prompt, available_tools)
     if anchor:
         prompt = f"{anchor}\n\n{prompt}"
     return ThinkRequest(
@@ -533,6 +606,7 @@ def build_produce_prompt(
         stage="produce",
         prompt=prompt,
         schema_hint=f"produce_{deliverable_type}",
+        available_tools=available_tools or [],
     )
 
 

@@ -13,7 +13,13 @@ from app.dao.agent_role_dao import (
     list_agent_roles,
     save_agent_role,
 )
-from app.dao.db_init import close_db_pool, init_db
+from app.dao.artifact_dao import (
+    get_artifact,
+    get_artifacts_by_ids,
+    list_artifacts,
+    next_version,
+    publish_artifact,
+)
 from app.dao.event_dao import last_event_seq, load_events, save_event
 from app.dao.meeting_aux_dao import (
     get_meeting_aux,
@@ -49,25 +55,28 @@ from app.dao.tag_dao import (
 __all__ = [
     "add_meeting_tag",
     "batch_delete_meetings",
-    "close_db_pool",
     "delete_agent_role",
     "delete_preference",
     "get_agent_role",
     "get_agent_roles_by_ids",
     "get_all_preferences",
+    "get_artifact",
+    "get_artifacts_by_ids",
     "get_meeting",
     "get_meeting_aux",
     "get_meeting_tags",
     "get_meetings_by_ids",
     "get_preference",
     "hard_delete_meeting",
-    "init_db",
     "last_event_seq",
     "list_agent_roles",
     "list_all_tags",
+    "list_artifacts",
     "list_meetings",
     "list_messages",
     "load_events",
+    "next_version",
+    "publish_artifact",
     "query_meetings",
     "recover_running_meetings",
     "remove_meeting_tag",

@@ -13,13 +13,13 @@ from typing import Any
 
 from app.events import bus, make_event
 from app.logging_config import get_logger
-from app.models import MeetingState, MeetingStatus, Role, Stage
+from app.models import MeetingState, Role, Stage
 from conclave_core.charter import build_charter_from_clarify
 from conclave_core.conclusion_logic import lock_conclusion
 from conclave_core.confidence import worst_confidence
 from conclave_core.roles import match_role
 from conclave_core.state import get_skipped_stages
-from conclave_core.state import next_stage as _next_stage
+from conclave_core.state import next_stage as _next_stage  # noqa: F401 (fallback)
 from conclave_core.text import (
     compress_decisions_to_brief,
     format_arbitrate_as_text,
@@ -27,6 +27,12 @@ from conclave_core.text import (
 )
 
 from .stage_common import emit_agent_spoke, record_drift
+from .topic_decomposer import decompose_topic, should_decompose
+from .workflow_templates import (
+    DELIVERABLE_TEMPLATE_MAP,
+    complexity_to_template,
+    next_stage_with_template,
+)
 
 _logger = get_logger("orchestrator.stage_runners")
 
@@ -59,19 +65,69 @@ async def run_clarify(state: MeetingState, result: dict[str, Any], confidence: s
         depth_map = {"simple": "light", "standard": "standard", "full": "deep"}
         state.debate_depth = depth_map.get(complexity, "standard")
 
+    # ADR-014 Phase 2: 根据 complexity + topic_type 选择工作流模板
+    topic_type = result.get("topic_type", "report")
+    # ADR-017 Phase 1（T1.8 / I6）：产出类型属于三新类型时固定专用模板，
+    # 不被 complexity 映射覆写（参照上方 plan 保留模式）
+    pinned_template = DELIVERABLE_TEMPLATE_MAP.get(state.deliverable_type)
+    if pinned_template:
+        state.workflow_template = pinned_template
+    else:
+        state.workflow_template = complexity_to_template(complexity, topic_type)
+
+    # ADR-014 Phase 3: 议题拆分（仅 full 复杂度 + 非 standard 模板时执行）
+    # ADR-017 Phase 1：固定模板的会议不做议题拆分，
+    # 防止首个子议题模板覆写固定模板（拆分能力与产物链暂不组合）
+    if pinned_template is None and should_decompose(complexity, state.workflow_template):
+        _logger.info(
+            "会议 %s 触发议题拆分 (complexity=%s, template=%s)", state.meeting_id, complexity, state.workflow_template
+        )
+        decomposition = await decompose_topic(
+            topic=state.clarified_topic or state.topic,
+            key_questions=state.key_questions,
+            team_config=state.team_config,
+        )
+        if decomposition is not None:
+            # 序列化存储到 state
+            state.topic_decomposition = decomposition.model_dump()
+            state.current_subtopic_idx = 0
+            # 第一个子议题的 workflow_template 覆盖当前模板
+            first_subtopic = decomposition.subtopics[0]
+            state.workflow_template = first_subtopic.workflow_template
+            _logger.info(
+                "会议 %s 议题拆分成功: %d 个子议题, 首个模板=%s",
+                state.meeting_id,
+                len(decomposition.subtopics),
+                state.workflow_template,
+            )
+            await bus.publish(
+                make_event(
+                    "topic.decomposed",
+                    state.meeting_id,
+                    {
+                        "subtopic_count": len(decomposition.subtopics),
+                        "subtopics": [s.model_dump() for s in decomposition.subtopics],
+                        "aggregation_strategy": decomposition.aggregation_strategy,
+                    },
+                )
+            )
+        else:
+            _logger.warning("会议 %s 议题拆分失败，回退到标准流程", state.meeting_id)
+
     await bus.publish(
         make_event(
             "flow_plan.set",
             state.meeting_id,
             {
                 "flow_plan": state.flow_plan,
+                "workflow_template": state.workflow_template,
                 "debate_depth": state.debate_depth,
                 "skipped_stages": [s.value for s in get_skipped_stages(state.flow_plan)],
             },
         )
     )
 
-    nxt = _next_stage(Stage.CLARIFY, state.flow_plan)
+    nxt = next_stage_with_template(Stage.CLARIFY, state.workflow_template, state.flow_plan)
     state.stage = nxt or Stage.INTRA_TEAM
     return state
 
@@ -102,13 +158,13 @@ async def run_arbitrate(state: MeetingState, result: dict[str, Any], confidence:
     await emit_agent_spoke(state, Role.MODERATOR, Stage.ARBITRATE, content)
     record_drift(state, Role.MODERATOR, Stage.ARBITRATE, content)
 
-    nxt = _next_stage(Stage.ARBITRATE, state.flow_plan)
+    nxt = next_stage_with_template(Stage.ARBITRATE, state.workflow_template, state.flow_plan)
     state.stage = nxt or Stage.PRODUCE
     return state
 
 
 async def run_cross_team(state: MeetingState, result: dict[str, Any], confidence: str = "high") -> MeetingState:
-    """CrossTeam 阶段：把 LLM 返回结果写回 MeetingState"""
+    """CrossTeam 阶段：把 LLM 返回结果写回 MeetingState（含 ADR-010 质量门禁）"""
     from app.orchestrator.borrow_helpers import _let_borrowed_agents_speak, _moderator_assess_borrow
     from app.orchestrator.evidence_helpers import _prefetch_evidence
 
@@ -116,9 +172,116 @@ async def run_cross_team(state: MeetingState, result: dict[str, Any], confidence
     for c in conflicts:
         if "conflict_type" not in c and "type" in c:
             c["conflict_type"] = c.pop("type")
+        # 规范化 sides[] 数组格式 → side_a/side_b（兼容 LLM 返回的两种格式）
+        if "sides" in c and isinstance(c["sides"], list) and len(c["sides"]) >= 2:
+            sides = c["sides"]
+            if not c.get("side_a"):
+                c["side_a"] = sides[0].get("text", sides[0].get("claim", ""))
+            if not c.get("side_b"):
+                c["side_b"] = sides[1].get("text", sides[1].get("claim", ""))
+            # 从 sides[].claim_id 收集 claim_refs（门禁校验用）
+            side_claim_refs = [s.get("claim_id") for s in sides if isinstance(s, dict) and s.get("claim_id")]
+            if side_claim_refs and not c.get("claim_refs"):
+                c["claim_refs"] = side_claim_refs
     state.conflicts = conflicts
     lock_conclusion(state.conclusion_chain, "cross_team", {"conflicts": conflicts})
     state.confidence_flags["cross_team"] = confidence
+
+    # ADR-010: 质量门禁 — 解析主持人门禁判断 + 代码层硬校验
+    gate = result.get("gate") or {}
+    gate_decision = gate.get("decision", "pass")
+    gate_reason = gate.get("reason", "")
+    target_roles = list(gate.get("target_roles", []))
+    weak_dimensions = list(gate.get("weak_dimensions", []))
+
+    # 空冲突校验：门禁判 pass 但未识别出任何冲突 → 矛盾，强制改判 supplement
+    # cross_team 的核心任务就是找冲突，pass 必须有冲突支撑
+    if gate_decision == "pass" and not conflicts:
+        gate_decision = "supplement"
+        gate_reason = "代码层校验：门禁判定 pass 但未识别出任何冲突，cross_team 核心任务未完成"
+        # 所有角色都需要补充论点以暴露分歧
+        target_roles = list({concl.get("role", "") for concl in state.team_conclusions if concl.get("role")})
+        weak_dimensions.append("2")
+        _logger.warning(
+            "cross_team 空冲突校验：gate_decision pass→supplement，target_roles=%s",
+            target_roles,
+        )
+
+    # 第二层防偏：代码层硬校验（不可被 LLM 绕过）
+    # 条件3：每个角色的 claims 至少有 1 条被冲突引用
+    if gate_decision == "pass" and conflicts and state.team_conclusions:
+        # 先收集所有 team_conclusions 中 claims 的标识（id 集合 + 文本集合）
+        all_claim_ids: set[str] = set()
+        all_claim_texts: list[str] = []
+        for conclusion in state.team_conclusions:
+            for c in conclusion.get("claims", []):
+                cid = c.get("id")
+                if cid:
+                    all_claim_ids.add(str(cid))
+                ctext = c.get("claim", c.get("text", ""))
+                if ctext:
+                    all_claim_texts.append(ctext)
+
+        referenced_claims: set[str] = set()
+        used_id_matching = False
+
+        for conflict in conflicts:
+            refs = conflict.get("claim_refs", [])
+            if isinstance(refs, list):
+                valid_refs = [str(r) for r in refs if str(r) in all_claim_ids]
+                if valid_refs:
+                    used_id_matching = True
+                    referenced_claims.update(valid_refs)
+
+        # 如果 ID 匹配没有命中任何 claim（LLM 返回了不存在的 claim_id），
+        # 回退到 side_a/side_b 文本匹配
+        # （注意：sides[] 格式已在函数开头规范化为 side_a/side_b）
+        if not used_id_matching:
+            for conflict in conflicts:
+                for field in ("side_a", "side_b", "summary"):
+                    text = conflict.get(field, "")
+                    if not text:
+                        continue
+                    text_norm = text.strip()[:20]
+                    for ct in all_claim_texts:
+                        ct_norm = ct.strip()
+                        if ct_norm and (text_norm in ct_norm or ct_norm[:20] in text_norm):
+                            referenced_claims.add(ct)
+                            break
+
+        unreferenced_roles: list[str] = []
+        for conclusion in state.team_conclusions:
+            role = conclusion.get("role", "")
+            # 收集该角色所有 claim 的标识（id + claim文本），兼容 ID 引用和文本匹配两种路径
+            role_claim_keys: set[str] = set()
+            for c in conclusion.get("claims", []):
+                cid = c.get("id")
+                if cid:
+                    role_claim_keys.add(str(cid))
+                ctext = c.get("claim", c.get("text", ""))
+                if ctext:
+                    role_claim_keys.add(ctext)
+            if role_claim_keys and not (role_claim_keys & referenced_claims):
+                unreferenced_roles.append(role)
+
+        if unreferenced_roles:
+            gate_decision = "supplement"
+            target_roles = unreferenced_roles
+            weak_dimensions.append("3")
+            gate_reason = f"代码层校验：以下角色的 claims 未被任何冲突引用: {unreferenced_roles}"
+
+    # 记录门禁历史
+    gate_round = len(state.gate_history) + 1
+    MAX_GATE_ROUNDS = 2
+    state.gate_history.append(
+        {
+            "round": gate_round,
+            "decision": gate_decision,
+            "reason": gate_reason,
+            "weak_dimensions": weak_dimensions,
+            "target_roles": target_roles,
+        }
+    )
 
     if conflicts:
         conflict_lines = [f"跨队辩论结束，识别出 {len(conflicts)} 个争议点："]
@@ -173,30 +336,71 @@ async def run_cross_team(state: MeetingState, result: dict[str, Any], confidence
                     consensus_lines.append(f"  • [{role_name}] {claim_text}")
         content = "\n".join(consensus_lines)
 
+    # ADR-010: 主持人发言追加门禁决策
+    gate_label = {"pass": "通过", "supplement": "需补充", "re_examine": "需深挖"}.get(gate_decision, gate_decision)
+    content += f"\n\n[门禁] 第{gate_round}轮: {gate_label}"
+    if gate_reason:
+        content += f" — {gate_reason[:100]}"
+    if target_roles and gate_decision == "supplement":
+        content += f"（待补充: {', '.join(target_roles)}）"
+
     await emit_agent_spoke(state, Role.MODERATOR, Stage.CROSS_TEAM, content)
     record_drift(state, Role.MODERATOR, Stage.CROSS_TEAM, content)
 
     if conflicts:
         state.prefetched_evidence = await _prefetch_evidence(state, conflicts)
 
-    nxt = _next_stage(Stage.CROSS_TEAM, state.flow_plan)
-    if nxt == Stage.EVIDENCE_CHECK and not conflicts and state.flow_plan == "standard":
-        nxt = _next_stage(Stage.EVIDENCE_CHECK, state.flow_plan) or Stage.PRODUCE
+    # ADR-010: 门禁驱动回流（supplement/re_examine）
+    # 达到最大轮次时强制推进，防止无限循环
+    state.gate_pending_action = None
+    nxt: Stage = Stage.PRODUCE
+    if gate_round <= MAX_GATE_ROUNDS and gate_decision == "supplement" and target_roles:
+        # 回流到 intra_team：仅让指定角色补充论点
+        state.gate_pending_action = {
+            "action": "supplement",
+            "round": gate_round,
+            "reason": gate_reason,
+            "target_roles": target_roles,
+        }
+        state.prefetched_evidence = None  # 论点更新后证据需重新检索
+        nxt = Stage.INTRA_TEAM
+    elif gate_round <= MAX_GATE_ROUNDS and gate_decision == "re_examine" and weak_dimensions:
+        # 停在 cross_team：主持人重新审视冲突
+        state.gate_pending_action = {
+            "action": "re_examine",
+            "round": gate_round,
+            "reason": gate_reason,
+            "weak_dimensions": weak_dimensions,
+        }
+        state.prefetched_evidence = None
+        nxt = Stage.CROSS_TEAM
+    else:
+        # 门禁通过或达轮次上限：推进到下一阶段
+        next_s = next_stage_with_template(Stage.CROSS_TEAM, state.workflow_template, state.flow_plan)
+        if next_s == Stage.EVIDENCE_CHECK and not conflicts and state.flow_plan == "standard":
+            next_s = next_stage_with_template(Stage.EVIDENCE_CHECK, state.workflow_template, state.flow_plan)
+        nxt = next_s or Stage.PRODUCE
 
     await _moderator_assess_borrow(state, Stage.CROSS_TEAM)
     await _let_borrowed_agents_speak(state, Stage.CROSS_TEAM)
-    state.stage = nxt or Stage.PRODUCE
+    state.stage = nxt
     return state
 
 
 async def run_intra_team(
     state: MeetingState,
     role_results: list[dict[str, Any]],
+    replace_roles: set[str] | None = None,
 ) -> MeetingState:
     """IntraTeam 阶段：聚合每个角色的 claims，更新 MeetingState。
 
     role_results 每项结构：
         {"role": str, "stance": str, "claims": list[dict], "confidence": str, "react": bool}
+
+    replace_roles: ADR-010 门禁 supplement 模式下传入，指定需要替换 claims 的角色集合。
+        - None 或空集合：全量模式（首轮），追加所有角色的 claims
+        - 非空集合：替换模式，移除这些角色的旧 claims 后追加新 claims；
+          未在集合中的角色保留原有 claims 不变
     """
     import uuid
 
@@ -207,6 +411,18 @@ async def run_intra_team(
             {"role": "product_architect", "stance": "重价值与边界"},
             {"role": "engineer", "stance": "重可行性与风险"},
         ]
+
+    is_replace = bool(replace_roles)
+
+    # 替换模式：先移除旧 claims 和旧 team_conclusions
+    if is_replace:
+        replace_set = replace_roles or set()
+        # 从 state.claims 中移除被替换角色的旧 claims
+        state.claims = [c for c in state.claims if c.get("agent_role") not in replace_set]
+        # 从 team_conclusions 中移除被替换角色的旧结论
+        existing_conclusions = [c for c in state.team_conclusions if c.get("role") not in replace_set]
+    else:
+        existing_conclusions = []
 
     # 按原始顺序整理成员，未匹配角色跳过
     members: list[tuple[Role, str]] = []
@@ -221,11 +437,30 @@ async def run_intra_team(
     if not members:
         members = [(Role.PRODUCT_ARCHITECT, "重价值与边界"), (Role.ENGINEER, "重可行性与风险")]
 
-    conclusions: list[dict[str, Any]] = []
+    # 构建 role_results 的快速查找
+    rr_by_role: dict[str, dict[str, Any]] = {}
+    for rr in role_results:
+        rr_by_role[rr.get("role", "")] = rr
+
+    conclusions: list[dict[str, Any]] = list(existing_conclusions)
     worst_conf = "high"
 
-    # 保证按 members 顺序处理结果，与 role_results 顺序一致（Scheduler 拓扑层保证）
-    for (role, stance), rr in zip(members, role_results, strict=False):
+    # 全量模式：遍历所有 members；替换模式：只处理 role_results 中的角色
+    if is_replace:
+        process_members = []
+        for role, stance in members:
+            if role.value in (replace_roles or set()) and role.value in rr_by_role:
+                process_members.append((role, stance))
+        # 如果没匹配到（防御），回退处理所有 role_results
+        if not process_members:
+            for role, stance in members:
+                if role.value in rr_by_role:
+                    process_members.append((role, stance))
+    else:
+        process_members = [(r, s) for r, s in members if r.value in rr_by_role]
+
+    for role, stance in process_members:
+        rr = rr_by_role[role.value]
         conf = rr.get("confidence", "high")
         worst_conf = worst_confidence(worst_conf, conf)
         claims = rr.get("claims", [])
@@ -242,14 +477,41 @@ async def run_intra_team(
         await emit_agent_spoke(state, role, Stage.INTRA_TEAM, content, claim_refs=claim_ids)
         record_drift(state, role, Stage.INTRA_TEAM, content)
 
+    # 按 team_config 顺序重排 conclusions（替换模式下保持一致顺序）
+    role_order = [m[0].value for m in members]
+    conclusions.sort(key=lambda c: role_order.index(c["role"]) if c["role"] in role_order else 999)
+
     state.team_conclusions = conclusions
     lock_conclusion(state.conclusion_chain, "intra_team", {"claims": state.claims, "team_conclusions": conclusions})
     state.confidence_flags["intra_team"] = worst_conf
 
+    # claim 类型分布结构化日志：便于退化追踪和同质化检测
+    type_dist: dict[str, int] = {}
+    for concl in conclusions:
+        for c in concl.get("claims", []):
+            t = c.get("type", "unknown")
+            type_dist[t] = type_dist.get(t, 0) + 1
+    _logger.info(
+        "intra_team claim 类型分布: %s (共 %d 条)",
+        type_dist,
+        sum(type_dist.values()),
+    )
+    from app.observability.log_bus import log_bus
+
+    log_bus.info(
+        f"intra_team claim type distribution: {type_dist}",
+        logger="orchestrator.stage_runners",
+        extra={"stage": "intra_team", "claim_type_distribution": type_dist},
+    )
+
+    # 补充模式完成后清空门禁待执行动作，让后续 cross_team 正常执行
+    if is_replace:
+        state.gate_pending_action = None
+
     await _moderator_assess_borrow(state, Stage.INTRA_TEAM)
     await _let_borrowed_agents_speak(state, Stage.INTRA_TEAM)
 
-    nxt = _next_stage(Stage.INTRA_TEAM, state.flow_plan)
+    nxt = next_stage_with_template(Stage.INTRA_TEAM, state.workflow_template, state.flow_plan)
     state.stage = nxt or Stage.PRODUCE
     return state
 
@@ -314,7 +576,7 @@ async def run_evidence_check(
     await emit_agent_spoke(state, Role.MODERATOR, Stage.EVIDENCE_CHECK, summary)
 
     await _let_borrowed_agents_speak(state, Stage.EVIDENCE_CHECK)
-    nxt = _next_stage(Stage.EVIDENCE_CHECK, state.flow_plan)
+    nxt = next_stage_with_template(Stage.EVIDENCE_CHECK, state.workflow_template, state.flow_plan)
     state.stage = nxt or Stage.PRODUCE
     return state
 
@@ -338,7 +600,8 @@ async def run_produce(
         state.artifact = {}
 
     # 附件扫描：代码/服务类产出收集工作区文件
-    if state.deliverable_type in ("code_analysis", "tested_system", "deployable_service"):
+    # ADR-017 Phase 3（T3.1）：test_suite 测试文件落 workspace，同样需要附件扫描
+    if state.deliverable_type in ("code_analysis", "tested_system", "deployable_service", "test_suite"):
         ws_root = Path(settings.workspace_root) / state.meeting_id
         try:
             from app.orchestrator.produce_helpers import _scan_artifacts
@@ -394,13 +657,12 @@ async def run_produce(
     artifact_text = json.dumps(state.artifact, ensure_ascii=False, default=str)
     record_drift(state, Role.MODERATOR, Stage.PRODUCE, artifact_text)
 
-    # 终态
-    from datetime import datetime, timezone
-
+    # [P0-2 修复] 终态 DONE 不再在此处设置。
+    # Runner.run() 会在质量门禁评估通过后统一设置 DONE，
+    # 避免质量门禁被 is_terminal() 跳过导致自我迭代 Loop 失效。
+    # 参见 runner.py:436 的质量门禁逻辑。
+    # 注意：stage 仍需设置为 PRODUCE，标识当前阶段已完成。
     state.stage = Stage.PRODUCE
-    state.status = MeetingStatus.DONE
-    state.completed_at = datetime.now(timezone.utc)
-    _logger.info("produce: 状态已设为 DONE")
 
     # LLM 降级检测
     fallback_stages = [s for s, flag in state.confidence_flags.items() if flag == "fallback"]
